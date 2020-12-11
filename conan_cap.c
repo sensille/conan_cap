@@ -29,13 +29,19 @@
 #define SS_CNT_8	3
 #define SS_CNT_RLE	4
 #define SS_CNT_DONE	5
+
+typedef struct _pipeline {
+	uint32_t	data;
+	int		valid;
+} pipeline_t;
+
 typedef struct _signal {
 	int		state;
 	int		width;
 	int		rle;
 	int		slot;
 	int		cnt;
-	uint32_t	pipeline[7];
+	pipeline_t	pipeline[7];
 	int		buflen;
 	uint64_t	buf;
 	int		first_packet;
@@ -46,6 +52,7 @@ typedef struct _parser {
 	int		state;
 	int		first_frame;
 	uint64_t	systime_base;
+	int		base_set;
 	signal_t	signal;
 } parser_t;
 
@@ -66,14 +73,18 @@ report(char *fmt, ...)
 static void
 init_signal(signal_t *s)
 {
+	memset(s, 0, sizeof(*s));
 	s->state = SS_IDLE;
 	s->first_packet = 1;
 }
 
 static void
-sig_output(signal_t *s, uint32_t data, int n)
+sig_output(signal_t *s, pipeline_t sample, int n)
 {
-	printf("sig: data %x (repeated %d times)\n", data, n);
+	if (sample.valid)
+		printf("sig: data %x (repeated %d times)\n", sample.data, n);
+	else
+		printf("sig: data xxxxx (repeated %d times)\n", n);
 }
 
 static int
@@ -83,9 +94,8 @@ sig_get_bits(signal_t *s, int n, uint32_t *out)
 		return 0;
 
 	*out = (s->buf >> (s->buflen - n)) & ((1 << n) - 1);
-#if 1
-printf("get bits: buf %016lx len %d n %d out %x\n", s->buf, s->buflen, n, *out);
-#endif
+	lD("get bits: buf %016lx len %d n %d out %x\n", s->buf, s->buflen,
+		n, *out);
 	s->buflen -= n;
 
 	return 1;
@@ -96,11 +106,9 @@ sig_feed(signal_t *s, uint32_t d, int len)
 {
 	int i;
 	uint32_t bits;
-	uint32_t sample;
+	pipeline_t sample;
 
-#if 1
-	printf("sig_feed: in %08x\n", d);
-#endif
+	lD("sig_feed: in %08x\n", d);
 	s->buf <<= len;
 	s->buf |= d;
 	s->buflen += len;
@@ -120,8 +128,9 @@ sig_feed(signal_t *s, uint32_t d, int len)
 				break;
 			memmove(s->pipeline + 1, s->pipeline + 0,
 				sizeof(*s->pipeline) * 6);
-			s->pipeline[0] = bits;
-			sig_output(s, bits, 1);
+			s->pipeline[0].data = bits;
+			s->pipeline[0].valid = 1;
+			sig_output(s, s->pipeline[0], 1);
 			s->state = SS_IDLE;
 		} else if (s->state == SS_CNT_PRE) {
 			if (!sig_get_bits(s, 5, &bits))
@@ -184,11 +193,14 @@ init_parser(parser_t *p)
 }
 
 static char *
-ststr(uint64_t systime)
+ststr(parser_t *p, uint64_t systime)
 {
 	static char buf[100];
 
-	sprintf(buf, "%12ld", systime);
+	if (p->base_set)
+		sprintf(buf, "%14ld", systime);
+	else
+		strcpy(buf, "--------------");
 
 	return buf;
 }
@@ -196,7 +208,28 @@ ststr(uint64_t systime)
 static uint64_t
 relate_systime(parser_t *p, uint64_t systime, int bits)
 {
-	return systime;
+	int s1;
+	int s2;
+	int diff;
+
+	/*
+	 * systime should lie within +/- 1/4 of the range given by bits
+	 * of the current base. otherwise we refuse to relate it.
+	 * As the base is updated in steps of 2^28, this is the minimum
+	 * time we accept to relate
+	 */
+	if (bits < 28)
+		report("can't relate systimes with less than 28 bits\n");
+
+	s1 = (systime >> (bits - 2)) & 0x03;
+	s2 = p->systime_base >> (bits - 2) & 0x03;
+	diff = (s1 - s2) & 0x03;
+
+	if (diff == 1 || diff == 2)
+		report("systime %ld out of range of %ld\n", systime,
+			p->systime_base);
+
+	return (p->systime_base & ~((1ull << bits) - 1)) | systime;
 }
 
 static int
@@ -213,11 +246,13 @@ recv_mcu(parser_t *p, int type, uint32_t *b, int len)
 		systime |= b[1] << 16;
 		stbits = 48;
 	}
+#if 0
 	systime = relate_systime(p, systime, stbits);
+#endif
 	if (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_RX) {
-		printf("%s mcu rx %02x\n", ststr(systime), data);
+		printf("%s mcu rx %02x\n", ststr(p, systime), data);
 	} else {
-		printf("%s mcu tx %02x\n", ststr(systime), data);
+		printf("%s mcu tx %02x\n", ststr(p, systime), data);
 	}
 
 	return (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_TX_LONG) ? 2 : 1;
@@ -254,7 +289,7 @@ recv_as5311(parser_t *p, int type, uint32_t *b, int len)
 			par = !par;
 	if (status[0] != 0)
 		status[strlen(status) - 1] = 0; /* remove final space */
-	printf("%s as5311[%d] %s % 4d [%s]%s\n", ststr(systime), channel,
+	printf("%s as5311[%d] %s % 4d [%s]%s\n", ststr(p, systime), channel,
 		type == DAQT_AS5311_DAT ? "dat" : "mag", pos, status,
 		par ? " parity bad" : "");
 
@@ -266,11 +301,19 @@ recv_systime(parser_t *p, int type, uint32_t *b, int len)
 {
 	uint64_t systime;
 
-	systime = (((uint64_t)b[0] << 32) & 0xffffff) + b[1];
-
-	p->systime_base = systime;
+	systime = ((uint64_t)(b[0] & 0xffffff) << 32) + b[1];
 
 	printf("systime rollover to 0x%lx\n", systime);
+
+	/*
+	 * sanity check if we lost a packet. we could as well cope with the
+	 * occasional loss
+	 */
+	if (p->base_set && systime - p->systime_base > (1ull << 28))
+		report("unexpected jump in systime\n");
+
+	p->systime_base = systime;
+	p->base_set = 1;
 
 	return 2;
 }
@@ -302,7 +345,7 @@ recv_dro_data(parser_t *p, uint32_t *b, int len)
         if (sign)
             val = -val;
 
-	printf("%s dro[%d] %.3f\n", ststr(systime), channel, val);
+	printf("%s dro[%d] %.3f\n", ststr(p, systime), channel, val);
 
 	return 3;
 }
@@ -320,7 +363,7 @@ recv_signal_data(parser_t *p, uint32_t *b, int len)
 
 	systime = relate_systime(p, systime, 32);
 
-	printf("%s signal width %d rle %d off %d len %d\n", ststr(systime),
+	printf("%s signal width %d rle %d off %d len %d\n", ststr(p, systime),
 		width, rle, off, stlen);
 
 	if (s->width != 0 && s->width != width)
@@ -365,13 +408,13 @@ parse_frame(parser_t *p, uint8_t *pbuf, int len)
 	}
 	++p->seq;
 	if (seq != p->seq) {
-		if (seq == 0) {
-			fprintf(stderr, "restart in seq detected\n");
-			p->seq = 1;
-		} else {
-			report("bad seq in frame, expected %d got %d\n",
-				p->seq + 1, seq);
-		}
+		report("bad seq in frame, expected %d got %d\n",
+			p->seq + 1, seq);
+		/*
+		 * currently not reached. we could re-init the parser and
+		 * start over
+		 */
+		init_parser(p);
 	}
 	len = (len - 2) / 4;
 	/* bring into host byte order */
@@ -428,7 +471,7 @@ usage(void)
 int
 main(int argc, char **argv)
 {
-	int pfd;
+	int pfd = -1;
 	int len;
 	uint8_t buf[1520];
 	int  c;
@@ -501,12 +544,12 @@ main(int argc, char **argv)
 			printf("invalid signature in capture file\n");
 			exit(1);
 		}
-	}
-
-	pfd = socket(AF_PACKET, SOCK_DGRAM, htons(0x5139));
-	if (pfd == -1) {
-		perror("socket");
-		exit(1);
+	} else {
+		pfd = socket(AF_PACKET, SOCK_DGRAM, htons(0x5139));
+		if (pfd == -1) {
+			perror("socket");
+			exit(1);
+		}
 	}
 
 	while (1) {
