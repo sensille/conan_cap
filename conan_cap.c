@@ -10,6 +10,14 @@
 #include <sys/socket.h>
 #include <linux/if_packet.h>
 #include <net/ethernet.h> /* the L2 protocols */
+#include <assert.h>
+
+typedef unsigned long __uintptr_t;
+#include "tree.h"
+
+#define HZ 48000000
+#define RETENTION 300	/* 300ms buffer for sorting */
+#define RETENTION_CYCLES (HZ / 1000 * RETENTION)
 
 #define DAQT_MCU_RX           8
 #define DAQT_MCU_RX_LONG      9
@@ -58,13 +66,15 @@ typedef struct _parser {
 	signal_t	signal;
 	uint64_t	mcu_systime;
 	int		mcu_systime_set;
+	uint64_t	newest_systime;
 } parser_t;
 
 int verbose = 0;
 
-static char *ststr(parser_t *p, uint64_t systime);
+static void __attribute__ ((format (printf, 3, 4)))
+output(parser_t *p, uint64_t systime, const char *fmt, ...);
 
-static void
+static void __attribute__ ((format (printf, 1, 2)))
 report(char *fmt, ...)
 {
 	va_list ap;
@@ -90,11 +100,9 @@ sig_output(parser_t *p, pipeline_t sample, int n)
 	signal_t *s = &p->signal;
 
 	if (sample.valid)
-		printf("%s sig: data %x (repeated %d times)\n",
-			ststr(p, s->systime), sample.data, n);
+		output(p, s->systime, "sig data %x cnt %d", sample.data, n);
 	else
-		printf("%s sig: data xxxxx (repeated %d times)\n",
-			ststr(p, s->systime), n);
+		output(p, s->systime, "sig: data - cnt %d", n);
 
 	s->systime += n;
 }
@@ -205,19 +213,6 @@ init_parser(parser_t *p)
 	init_signal(&p->signal);
 }
 
-static char *
-ststr(parser_t *p, uint64_t systime)
-{
-	static char buf[100];
-
-	if (p->base_set)
-		sprintf(buf, "%14ld", systime);
-	else
-		strcpy(buf, "--------------");
-
-	return buf;
-}
-
 static uint64_t
 relate_systime(parser_t *p, uint64_t systime, int bits)
 {
@@ -272,9 +267,9 @@ recv_mcu(parser_t *p, int type, uint32_t *b, int len)
 		systime = relate_systime(p, systime, 48);
 
 	if (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_RX) {
-		printf("%s mcu rx %02x\n", ststr(p, systime), data);
+		output(p, systime, "mcu dir rx data %02x", data);
 	} else {
-		printf("%s mcu tx %02x\n", ststr(p, systime), data);
+		output(p, systime, "mcu dir tx data %02x", data);
 	}
 
 	return (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_TX_LONG) ? 2 : 1;
@@ -287,7 +282,7 @@ recv_as5311(parser_t *p, int type, uint32_t *b, int len)
 	uint64_t systime;
 	int channel;
 	int pos;
-	char status[100] = "";
+	char status[100] = ".";
 	int par = 0;
 	int i;
 
@@ -296,24 +291,25 @@ recv_as5311(parser_t *p, int type, uint32_t *b, int len)
 	systime = b[1];
 	systime = relate_systime(p, systime, 32);
 	pos = data >> 6;
+
 	if (data & 0x20)
-		strcat(status, "OCF ");
+		strcat(status, "OCF.");
 	if (data & 0x10)
-		strcat(status, "COF ");
+		strcat(status, "COF.");
 	if (data & 0x8)
-		strcat(status, "LIN ");
+		strcat(status, "LIN.");
 	if (data & 0x4)
-		strcat(status, "INC ");
+		strcat(status, "INC.");
 	if (data & 0x2)
-		strcat(status, "DEC ");
+		strcat(status, "DEC.");
 	for (i = 0; i < 18; ++i)
 		if (data & (1 << i))
 			par = !par;
-	if (status[0] != 0)
-		status[strlen(status) - 1] = 0; /* remove final space */
-	printf("%s as5311[%d] %s % 4d [%s]%s\n", ststr(p, systime), channel,
-		type == DAQT_AS5311_DAT ? "dat" : "mag", pos, status,
-		par ? " parity bad" : "");
+	if (par)
+		strcat(status, "PAR.");
+
+	output(p, systime, "as5311 chan %d type %s val %d status %s", channel,
+		type == DAQT_AS5311_DAT ? "dat" : "mag", pos, status);
 
 	return 2;
 }
@@ -325,7 +321,8 @@ recv_systime(parser_t *p, int type, uint32_t *b, int len)
 
 	systime = ((uint64_t)(b[0] & 0xffffff) << 32) + b[1];
 
-	printf("systime rollover to 0x%lx\n", systime);
+	output(p, systime, "systime type %s",
+		type == DAQT_SYSTIME_SET ? "set" : "rollover");
 
 	/*
 	 * sanity check if we lost a packet. we could as well cope with the
@@ -367,7 +364,7 @@ recv_dro_data(parser_t *p, uint32_t *b, int len)
         if (sign)
             val = -val;
 
-	printf("%s dro[%d] %.3f\n", ststr(p, systime), channel, val);
+	output(p, systime, "dro channel %d val %.3f", channel, val);
 
 	return 3;
 }
@@ -391,8 +388,8 @@ recv_signal_data(parser_t *p, uint32_t *b, int len)
 		s->systime_related = 1;
 	}
 
-	printf("%s signal width %d rle %d off %d len %d\n",
-		ststr(p, relate_systime(p, systime, 32)),
+	lD("%ld signal width %d rle %d off %d len %d\n",
+		relate_systime(p, systime, 32),
 		width, rle, off, stlen);
 
 	if (s->width != 0 && s->width != width)
@@ -484,6 +481,81 @@ parse_frame(parser_t *p, uint8_t *pbuf, int len)
 		b += l;
 		len -= l;
 	}
+}
+
+typedef struct _buffer_elem {
+	RB_ENTRY(_buffer_elem)	rbnode;
+	uint64_t		systime;
+	char			buf[0];
+} buffer_elem_t;
+
+int becmp(buffer_elem_t *, buffer_elem_t *);
+
+RB_HEAD(betree, _buffer_elem) behead = RB_INITIALIZER(&behead);
+RB_PROTOTYPE(betree, _buffer_elem, rbnode, becmp)
+RB_GENERATE(betree, _buffer_elem, rbnode, becmp)
+
+int
+becmp(buffer_elem_t *e1, buffer_elem_t *e2)
+{
+	if (e1->systime < e2->systime)
+		return -1;
+	if (e1->systime > e2->systime)
+		return 1;
+	return 0;
+}
+
+static void
+output(parser_t *p, uint64_t systime, const char *fmt, ...)
+{
+	va_list ap;
+	char buf[1000];
+	int len;
+	buffer_elem_t *be;
+
+	va_start(ap, fmt);
+	len = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	if (len > sizeof(buf))
+		report("overlong output %s\n", buf);
+
+	if (!p->base_set || systime == 0) {
+		/* no time given, output directly without sorting */
+		printf("-------------- %s\n", buf);
+
+		return;
+	}
+
+	/*
+	 * data might arrive a bit out of order. delay everything to sort
+	 * it. Max delay is around 200ms, 100ms timeout for sig plus 100ms
+	 * timeout for ethernet.
+	 */
+	be = malloc(sizeof(*be) + len + 1);
+	assert(be);
+	be->systime = systime;
+	strcpy(be->buf, buf);
+
+	RB_INSERT(betree, &behead, be);
+
+	if (systime > p->newest_systime)
+		p->newest_systime = systime;
+
+	while (1) {
+		be = RB_MIN(betree, &behead);
+
+		if (be->systime + RETENTION_CYCLES > p->newest_systime)
+			break;
+
+		RB_REMOVE(betree, &behead, be);
+
+		printf("%14ld %s\n", be->systime, be->buf);
+
+		free(be);
+	}
+
+	return;
 }
 
 void
