@@ -45,6 +45,8 @@ typedef struct _signal {
 	int		buflen;
 	uint64_t	buf;
 	int		first_packet;
+	uint64_t	systime;
+	int		systime_related;
 } signal_t;
 
 typedef struct _parser {
@@ -54,9 +56,13 @@ typedef struct _parser {
 	uint64_t	systime_base;
 	int		base_set;
 	signal_t	signal;
+	uint64_t	mcu_systime;
+	int		mcu_systime_set;
 } parser_t;
 
 int verbose = 0;
+
+static char *ststr(parser_t *p, uint64_t systime);
 
 static void
 report(char *fmt, ...)
@@ -79,12 +85,18 @@ init_signal(signal_t *s)
 }
 
 static void
-sig_output(signal_t *s, pipeline_t sample, int n)
+sig_output(parser_t *p, pipeline_t sample, int n)
 {
+	signal_t *s = &p->signal;
+
 	if (sample.valid)
-		printf("sig: data %x (repeated %d times)\n", sample.data, n);
+		printf("%s sig: data %x (repeated %d times)\n",
+			ststr(p, s->systime), sample.data, n);
 	else
-		printf("sig: data xxxxx (repeated %d times)\n", n);
+		printf("%s sig: data xxxxx (repeated %d times)\n",
+			ststr(p, s->systime), n);
+
+	s->systime += n;
 }
 
 static int
@@ -102,8 +114,9 @@ sig_get_bits(signal_t *s, int n, uint32_t *out)
 }
 
 static void
-sig_feed(signal_t *s, uint32_t d, int len)
+sig_feed(parser_t *p, uint32_t d, int len)
 {
+	signal_t *s = &p->signal;
 	int i;
 	uint32_t bits;
 	pipeline_t sample;
@@ -130,7 +143,7 @@ sig_feed(signal_t *s, uint32_t d, int len)
 				sizeof(*s->pipeline) * 6);
 			s->pipeline[0].data = bits;
 			s->pipeline[0].valid = 1;
-			sig_output(s, s->pipeline[0], 1);
+			sig_output(p, s->pipeline[0], 1);
 			s->state = SS_IDLE;
 		} else if (s->state == SS_CNT_PRE) {
 			if (!sig_get_bits(s, 5, &bits))
@@ -166,7 +179,7 @@ sig_feed(signal_t *s, uint32_t d, int len)
 						sizeof(*s->pipeline) *
 							(s->slot - 1));
 					s->pipeline[0] = sample;
-					sig_output(s, sample, 1);
+					sig_output(p, sample, 1);
 				} 
 			} else {
 				/*
@@ -174,7 +187,7 @@ sig_feed(signal_t *s, uint32_t d, int len)
 				 * optimization
 				 */
 				sample = s->pipeline[s->slot - 1];
-				sig_output(s, sample, s->cnt);
+				sig_output(p, sample, s->cnt);
 			}
 			s->state = SS_IDLE;
 		} else {
@@ -221,6 +234,9 @@ relate_systime(parser_t *p, uint64_t systime, int bits)
 	if (bits < 28)
 		report("can't relate systimes with less than 28 bits\n");
 
+	if (!p->base_set)
+		return systime;
+
 	s1 = (systime >> (bits - 2)) & 0x03;
 	s2 = p->systime_base >> (bits - 2) & 0x03;
 	diff = (s1 - s2) & 0x03;
@@ -237,18 +253,24 @@ recv_mcu(parser_t *p, int type, uint32_t *b, int len)
 {
 	uint64_t systime;
 	uint8_t data;
-	int stbits = 16;
 
 	systime = b[0] & 0xffff;
 	data = (b[0] >> 16) & 0xff;
 
 	if (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_TX_LONG) {
-		systime |= b[1] << 16;
-		stbits = 48;
+		systime |= (uint64_t)b[1] << 16;
+		p->mcu_systime = systime & ~0xffff;
+		p->mcu_systime_set = 1;
+	} else {
+		if (!p->mcu_systime_set)
+			systime = 0;
+		else
+			systime |= p->mcu_systime;
 	}
-#if 0
-	systime = relate_systime(p, systime, stbits);
-#endif
+
+	if (systime != 0)
+		systime = relate_systime(p, systime, 48);
+
 	if (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_RX) {
 		printf("%s mcu rx %02x\n", ststr(p, systime), data);
 	} else {
@@ -361,9 +383,16 @@ recv_signal_data(parser_t *p, uint32_t *b, int len)
 	uint64_t systime = b[1];
 	int i = 0;
 
-	systime = relate_systime(p, systime, 32);
+	if (s->first_packet)
+		s->systime = systime;
 
-	printf("%s signal width %d rle %d off %d len %d\n", ststr(p, systime),
+	if (!s->systime_related && p->base_set) {
+		s->systime = relate_systime(p, s->systime, 32);
+		s->systime_related = 1;
+	}
+
+	printf("%s signal width %d rle %d off %d len %d\n",
+		ststr(p, relate_systime(p, systime, 32)),
 		width, rle, off, stlen);
 
 	if (s->width != 0 && s->width != width)
@@ -375,14 +404,13 @@ recv_signal_data(parser_t *p, uint32_t *b, int len)
 	s->rle = rle;
 
 	if (s->first_packet && off) {
-		sig_feed(&p->signal, b[2] & ((1 << (32 - off)) - 1),
-			32 - off);
+		sig_feed(p, b[2] & ((1 << (32 - off)) - 1), 32 - off);
 		i = 1;
 	}
 	s->first_packet = 0;
 
 	for (; i < stlen; ++i)
-		sig_feed(&p->signal, b[2 + i], 32);
+		sig_feed(p, b[2 + i], 32);
 
 	return stlen + 2;
 }
