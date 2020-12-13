@@ -14,6 +14,7 @@
 
 typedef unsigned long __uintptr_t;
 #include "tree.h"
+#include "models.h"
 
 #define HZ 48000000
 #define RETENTION 300	/* 300ms buffer for sorting */
@@ -69,10 +70,26 @@ typedef struct _parser {
 	uint64_t	newest_systime;
 } parser_t;
 
+#define MAX_VALUES	20
+
+const char *type_names[] = { "mcu", "systime", "sig", "as5311", "dro" };
+const char *field_names[][MAX_VALUES] = {
+	{ "dir", "data", },
+	{ "type", },
+	{ "data", "valid", "cnt", },
+	{ "channel", "type", "pos", "status", },
+	{ "channel", "data" },
+};
+
+#define MAX_MODELS	100
+int nmodels = 0;
+void (*models[MAX_MODELS])(buffer_elem_t *be);
 int verbose = 0;
 
-static void __attribute__ ((format (printf, 3, 4)))
-output(parser_t *p, uint64_t systime, const char *fmt, ...);
+int do_output = 1;
+
+static void
+output(parser_t *p, uint64_t systime, int type, int n, value_t *v);
 
 static void __attribute__ ((format (printf, 1, 2)))
 report(char *fmt, ...)
@@ -98,11 +115,16 @@ static void
 sig_output(parser_t *p, pipeline_t sample, int n)
 {
 	signal_t *s = &p->signal;
+	value_t v[3];
 
-	if (sample.valid)
-		output(p, s->systime, "sig data %x cnt %d", sample.data, n);
-	else
-		output(p, s->systime, "sig: data - cnt %d", n);
+	v[0].type = VT_HEX;
+	v[0].ui = sample.data;
+	v[1].type = VT_UINT;
+	v[1].ui = sample.valid;
+	v[2].type = VT_UINT;
+	v[2].ui = n;
+
+	output(p, s->systime, MT_SIG, 3, v);
 
 	s->systime += n;
 }
@@ -188,7 +210,7 @@ sig_feed(parser_t *p, uint32_t d, int len)
 							(s->slot - 1));
 					s->pipeline[0] = sample;
 					sig_output(p, sample, 1);
-				} 
+				}
 			} else {
 				/*
 				 * this is just a performance
@@ -248,6 +270,7 @@ recv_mcu(parser_t *p, int type, uint32_t *b, int len)
 {
 	uint64_t systime;
 	uint8_t data;
+	value_t v[2];
 
 	systime = b[0] & 0xffff;
 	data = (b[0] >> 16) & 0xff;
@@ -266,11 +289,15 @@ recv_mcu(parser_t *p, int type, uint32_t *b, int len)
 	if (systime != 0)
 		systime = relate_systime(p, systime, 48);
 
+	v[0].type = VT_STRING;
 	if (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_RX) {
-		output(p, systime, "mcu dir rx data %02x", data);
+		v[0].s = "rx";
 	} else {
-		output(p, systime, "mcu dir tx data %02x", data);
+		v[0].s = "tx";
 	}
+	v[1].type = VT_HEX;
+	v[1].ui = data;
+	output(p, systime, MT_MCU, 2, v);
 
 	return (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_TX_LONG) ? 2 : 1;
 }
@@ -285,6 +312,7 @@ recv_as5311(parser_t *p, int type, uint32_t *b, int len)
 	char status[100] = ".";
 	int par = 0;
 	int i;
+	value_t v[4];
 
 	channel = (b[0] >> 18) & 0x3f;
 	data = b[0] & 0x3ffff;
@@ -308,8 +336,15 @@ recv_as5311(parser_t *p, int type, uint32_t *b, int len)
 	if (par)
 		strcat(status, "PAR.");
 
-	output(p, systime, "as5311 chan %d type %s val %d status %s", channel,
-		type == DAQT_AS5311_DAT ? "dat" : "mag", pos, status);
+	v[0].type = VT_UINT;
+	v[0].ui = channel;
+	v[1].type = VT_STRING;
+	v[1].s = type == DAQT_AS5311_DAT ? "dat" : "mag";
+	v[2].type = VT_UINT;
+	v[2].ui = pos;
+	v[3].type = VT_STRING;
+	v[3].s = status;
+	output(p, systime, MT_AS5311, 4, v);
 
 	return 2;
 }
@@ -318,11 +353,13 @@ static int
 recv_systime(parser_t *p, int type, uint32_t *b, int len)
 {
 	uint64_t systime;
+	value_t v;
 
 	systime = ((uint64_t)(b[0] & 0xffffff) << 32) + b[1];
 
-	output(p, systime, "systime type %s",
-		type == DAQT_SYSTIME_SET ? "set" : "rollover");
+	v.type = VT_STRING;
+	v.s = type == DAQT_SYSTIME_SET ? "set" : "rollover";
+	output(p, systime, MT_SYSTIME, 1, &v);
 
 	/*
 	 * sanity check if we lost a packet. we could as well cope with the
@@ -348,6 +385,7 @@ recv_dro_data(parser_t *p, uint32_t *b, int len)
 	int i;
 	int sign;
 	float val;
+	value_t v[2];
 
 	systime = relate_systime(p, systime, 32);
 
@@ -359,12 +397,16 @@ recv_dro_data(parser_t *p, uint32_t *b, int len)
 		data |= d & 1;
 		d >>= 1;
 	}
-        sign = data & (1 << 20);
-        val = (data & ((1 << 20) - 1)) / 1000.;
-        if (sign)
-            val = -val;
+	sign = data & (1 << 20);
+	val = (data & ((1 << 20) - 1)) / 1000.;
+	if (sign)
+		val = -val;
 
-	output(p, systime, "dro channel %d val %.3f", channel, val);
+	v[0].type = VT_UINT;
+	v[0].ui = channel;
+	v[1].type = VT_FLOAT;
+	v[1].f = val;
+	output(p, systime, MT_DRO, 2, v);
 
 	return 3;
 }
@@ -483,20 +525,12 @@ parse_frame(parser_t *p, uint8_t *pbuf, int len)
 	}
 }
 
-typedef struct _buffer_elem {
-	RB_ENTRY(_buffer_elem)	rbnode;
-	uint64_t		systime;
-	char			buf[0];
-} buffer_elem_t;
-
 int becmp(buffer_elem_t *, buffer_elem_t *);
-
 RB_HEAD(betree, _buffer_elem) behead = RB_INITIALIZER(&behead);
 RB_PROTOTYPE(betree, _buffer_elem, rbnode, becmp)
 RB_GENERATE(betree, _buffer_elem, rbnode, becmp)
 
-int
-becmp(buffer_elem_t *e1, buffer_elem_t *e2)
+int becmp(buffer_elem_t *e1, buffer_elem_t *e2)
 {
 	if (e1->systime < e2->systime)
 		return -1;
@@ -506,36 +540,90 @@ becmp(buffer_elem_t *e1, buffer_elem_t *e2)
 }
 
 static void
-output(parser_t *p, uint64_t systime, const char *fmt, ...)
+output_be(parser_t *p, buffer_elem_t *be)
 {
-	va_list ap;
-	char buf[1000];
-	int len;
-	buffer_elem_t *be;
+	int i;
 
-	va_start(ap, fmt);
-	len = vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
+	/*
+	 * feed to models
+	 */
+	for (i = 0; i < nmodels; ++i)
+		models[i](be);
 
-	if (len > sizeof(buf))
-		report("overlong output %s\n", buf);
+	if (!do_output)
+		goto free;
 
-	if (!p->base_set || systime == 0) {
-		/* no time given, output directly without sorting */
-		printf("-------------- %s\n", buf);
+	if (be->systime == 0)
+		printf("-------------- ");
+	else
+		printf("% 14ld ", be->systime);
 
-		return;
+	printf("%s", type_names[be->mtype]);
+
+	for (i = 0; i < be->n; ++i) {
+		if (be->values[i].type == VT_UINT) {
+			printf(" %s=%ld", field_names[be->mtype][i],
+				be->values[i].ui);
+		} else if (be->values[i].type == VT_HEX) {
+			printf(" %s=%lx", field_names[be->mtype][i],
+				be->values[i].ui);
+		} else if (be->values[i].type == VT_FLOAT) {
+			printf(" %s=%lf", field_names[be->mtype][i],
+				be->values[i].f);
+		} else if (be->values[i].type == VT_STRING) {
+			printf(" %s=%s", field_names[be->mtype][i],
+				be->values[i].s);
+		}
 	}
+	printf("\n");
+
+free:
+	for (i = 0; i < be->n; ++i)
+		if (be->values[i].type == VT_STRING)
+			free(be->values[i].s);
+	free(be->values);
+}
+
+static void
+output(parser_t *p, uint64_t systime, int mtype, int n, value_t *values_in)
+{
+	buffer_elem_t *be;
+	int i;
+	value_t *values;
+
+	if (n > MAX_VALUES)
+		report("too many values, increase MAX_VALUES\n");
+
+	/*
+	 * copy values
+	 */
+	values = malloc(sizeof(*values) * n);
+	memcpy(values, values_in, sizeof(*values) * n);
+	for (i = 0; i < n; ++i) {
+		if (values_in[i].type == VT_STRING)
+			values[i].s = strdup(values_in[i].s);
+	}
+
+	if (!p->base_set)
+		systime = 0;
 
 	/*
 	 * data might arrive a bit out of order. delay everything to sort
 	 * it. Max delay is around 200ms, 100ms timeout for sig plus 100ms
 	 * timeout for ethernet.
 	 */
-	be = malloc(sizeof(*be) + len + 1);
+	be = malloc(sizeof(*be));
 	assert(be);
 	be->systime = systime;
-	strcpy(be->buf, buf);
+	be->mtype = mtype;
+	be->n = n;
+	be->values = values;
+
+	if (systime == 0) {
+		/* no systime, output directly */
+		output_be(p, be);
+		return;
+	}
 
 	RB_INSERT(betree, &behead, be);
 
@@ -550,9 +638,7 @@ output(parser_t *p, uint64_t systime, const char *fmt, ...)
 
 		RB_REMOVE(betree, &behead, be);
 
-		printf("%14ld %s\n", be->systime, be->buf);
-
-		free(be);
+		output_be(p, be);
 	}
 
 	return;
@@ -565,6 +651,8 @@ usage(void)
 	printf("       -r <file>   : read input from file\n");
 	printf("       -w <file>   : write capture to file\n");
 	printf("       -v          : verbose mode\n");
+	printf("       -q          : quiet, no direct output\n");
+	printf("       -1          : feed to model 1\n");
 	exit(1);
 }
 
@@ -582,7 +670,7 @@ main(int argc, char **argv)
 	int ret;
 	parser_t parser;
 
-	while ((c = getopt(argc, argv, "w:r:vh?")) != EOF) {
+	while ((c = getopt(argc, argv, "w:r:vq1h?")) != EOF) {
 		switch(c) {
 		case 'w':
 			wrname = optarg;
@@ -592,6 +680,12 @@ main(int argc, char **argv)
 			break;
 		case 'v':
 			verbose = 1;
+			break;
+		case 'q':
+			do_output = 0;
+			break;
+		case '1':
+			models[nmodels++] = model1;
 			break;
 		case 'h':
 		case '?':
@@ -639,7 +733,7 @@ main(int argc, char **argv)
 			printf("short read\n");
 			exit(1);
 		}
-		
+
 		if (strncmp(buf, "conancap", 8) != 0) {
 			printf("invalid signature in capture file\n");
 			exit(1);
