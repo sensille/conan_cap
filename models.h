@@ -33,6 +33,11 @@ typedef enum {
 	MT_DRO,
 } msg_type_t;
 
-void model1(buffer_elem_t *be);
+void model1(void *ctx, buffer_elem_t *be);
+void *init_model1(int verbose);
+void model2(void *ctx, buffer_elem_t *be);
+void *init_model2(int verbose);
+
+void __attribute__ ((format (printf, 1, 2))) report(char *fmt, ...);
 
 #endif

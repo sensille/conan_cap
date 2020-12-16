@@ -83,19 +83,22 @@ const char *field_names[][MAX_VALUES] = {
 
 #define MAX_MODELS	100
 int nmodels = 0;
-void (*models[MAX_MODELS])(buffer_elem_t *be);
+void (*models[MAX_MODELS])(void *ctx, buffer_elem_t *be);
+void *mctx[MAX_MODELS];
 int verbose = 0;
+static int dont_sort = 0;
 
 int do_output = 1;
 
 static void
 output(parser_t *p, uint64_t systime, int type, int n, value_t *v);
 
-static void __attribute__ ((format (printf, 1, 2)))
+void __attribute__ ((format (printf, 1, 2)))
 report(char *fmt, ...)
 {
 	va_list ap;
 
+	fflush(stdout);
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
@@ -288,6 +291,7 @@ recv_mcu(parser_t *p, int type, uint32_t *b, int len)
 
 	if (systime != 0)
 		systime = relate_systime(p, systime, 48);
+
 
 	v[0].type = VT_STRING;
 	if (type == DAQT_MCU_RX_LONG || type == DAQT_MCU_RX) {
@@ -490,7 +494,6 @@ parse_frame(parser_t *p, uint8_t *pbuf, int len)
 
 	while (len > 0) {
 		uint8_t type = b[0] >> 24;
-		lD("type %d len %d\n", type, len);
 		lD("data %08x %08x %08x\n", b[0], b[1], b[2]);
 		switch (type) {
 		case DAQT_MCU_RX:
@@ -520,6 +523,7 @@ parse_frame(parser_t *p, uint8_t *pbuf, int len)
 			report("unknown packet type %d\n", type);
 			break;
 		}
+		lD("type %d len %d l %d\n", type, len, l);
 		b += l;
 		len -= l;
 	}
@@ -548,7 +552,7 @@ output_be(parser_t *p, buffer_elem_t *be)
 	 * feed to models
 	 */
 	for (i = 0; i < nmodels; ++i)
-		models[i](be);
+		models[i](mctx[i], be);
 
 	if (!do_output)
 		goto free;
@@ -582,6 +586,7 @@ free:
 		if (be->values[i].type == VT_STRING)
 			free(be->values[i].s);
 	free(be->values);
+	free(be);
 }
 
 static void
@@ -619,7 +624,7 @@ output(parser_t *p, uint64_t systime, int mtype, int n, value_t *values_in)
 	be->n = n;
 	be->values = values;
 
-	if (systime == 0) {
+	if (systime == 0 || dont_sort) {
 		/* no systime, output directly */
 		output_be(p, be);
 		return;
@@ -653,6 +658,7 @@ usage(void)
 	printf("       -v          : verbose mode\n");
 	printf("       -q          : quiet, no direct output\n");
 	printf("       -1          : feed to model 1\n");
+	printf("       -u          : unsorted, don't sort by timestamp\n");
 	exit(1);
 }
 
@@ -670,13 +676,16 @@ main(int argc, char **argv)
 	int ret;
 	parser_t parser;
 
-	while ((c = getopt(argc, argv, "w:r:vq1h?")) != EOF) {
+	while ((c = getopt(argc, argv, "w:r:vuq12h?")) != EOF) {
 		switch(c) {
 		case 'w':
 			wrname = optarg;
 			break;
 		case 'r':
 			rdname = optarg;
+			break;
+		case 'u':
+			dont_sort = 1;
 			break;
 		case 'v':
 			verbose = 1;
@@ -685,7 +694,12 @@ main(int argc, char **argv)
 			do_output = 0;
 			break;
 		case '1':
+			mctx[nmodels] = init_model1(verbose);
 			models[nmodels++] = model1;
+			break;
+		case '2':
+			mctx[nmodels] = init_model2(verbose);
+			models[nmodels++] = model2;
 			break;
 		case 'h':
 		case '?':
