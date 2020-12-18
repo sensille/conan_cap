@@ -33,11 +33,13 @@ typedef enum {
 	MT_DRO,
 } msg_type_t;
 
+struct _parser;
 void model1(void *ctx, buffer_elem_t *be);
-void *init_model1(int verbose);
+void *init_model1(struct _parser *p,int verbose);
 void model2(void *ctx, buffer_elem_t *be);
-void *init_model2(int verbose);
+void *init_model2(struct _parser *p,int verbose);
 
 void __attribute__ ((format (printf, 1, 2))) report(char *fmt, ...);
+uint64_t relate_systime(struct _parser *p, uint64_t systime, int bits);
 
 #endif

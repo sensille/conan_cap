@@ -18,7 +18,7 @@ typedef unsigned long __uintptr_t;
 
 #define HZ 48000000
 #define RETENTION 300	/* 300ms buffer for sorting */
-#define RETENTION_CYCLES (HZ / 1000 * RETENTION)
+#define RETENTION_CYCLES ((HZ / 1000) * RETENTION)
 
 #define DAQT_MCU_RX           8
 #define DAQT_MCU_RX_LONG      9
@@ -68,6 +68,7 @@ typedef struct _parser {
 	uint64_t	mcu_systime;
 	int		mcu_systime_set;
 	uint64_t	newest_systime;
+	uint64_t	newest_delivered;
 } parser_t;
 
 #define MAX_VALUES	20
@@ -87,6 +88,7 @@ void (*models[MAX_MODELS])(void *ctx, buffer_elem_t *be);
 void *mctx[MAX_MODELS];
 int verbose = 0;
 static int dont_sort = 0;
+static int re_init_allowed = 0;
 
 int do_output = 1;
 
@@ -100,10 +102,15 @@ report(char *fmt, ...)
 
 	fflush(stdout);
 	va_start(ap, fmt);
+#if 0
 	vfprintf(stderr, fmt, ap);
+#else
+	vfprintf(stdout, fmt, ap);
+#endif
 	va_end(ap);
+	fflush(stdout);
 
-	exit(1);
+	abort();
 }
 
 static void
@@ -232,18 +239,29 @@ sig_feed(parser_t *p, uint32_t d, int len)
 static void
 init_parser(parser_t *p)
 {
+	int i;
+
 	memset(p, 0, sizeof(*p));
 	p->seq = -1;
 	p->first_frame = 1;
 	init_signal(&p->signal);
+
+	for (i = 0; i < nmodels; ++i) {
+		/* XXX well ... */
+		if (models[i] == model1)
+			mctx[i] = init_model1(p, verbose);
+		if (models[i] == model2)
+			mctx[i] = init_model2(p, verbose);
+	}
 }
 
-static uint64_t
+uint64_t
 relate_systime(parser_t *p, uint64_t systime, int bits)
 {
 	int s1;
 	int s2;
 	int diff;
+	uint64_t rel;
 
 	/*
 	 * systime should lie within +/- 1/4 of the range given by bits
@@ -258,14 +276,21 @@ relate_systime(parser_t *p, uint64_t systime, int bits)
 		return systime;
 
 	s1 = (systime >> (bits - 2)) & 0x03;
-	s2 = p->systime_base >> (bits - 2) & 0x03;
-	diff = (s1 - s2) & 0x03;
+	s2 = (p->systime_base >> (bits - 2)) & 0x03;
+	diff = (s2 - s1) & 0x03;
 
-	if (diff == 1 || diff == 2)
+	if (diff == 2 || diff == 3)
 		report("systime %ld out of range of %ld\n", systime,
 			p->systime_base);
 
-	return (p->systime_base & ~((1ull << bits) - 1)) | systime;
+	rel = (p->systime_base & ~((1ull << bits) - 1)) | systime;
+	if (s2 == 0 && s1 == 3)
+		rel -= (1ull << bits);
+#if 0
+printf("relate: s1 %d s2 %d systime %lx base %lx rel %lx %ld\n", s1, s2, systime, p->systime_base, rel, rel);
+#endif
+
+	return rel;
 }
 
 static int
@@ -479,13 +504,19 @@ parse_frame(parser_t *p, uint8_t *pbuf, int len)
 	}
 	++p->seq;
 	if (seq != p->seq) {
-		report("bad seq in frame, expected %d got %d\n",
-			p->seq + 1, seq);
+		if (!re_init_allowed || seq != 0)
+			report("bad seq in frame, expected %d got %d\n",
+				p->seq + 1, seq);
 		/*
 		 * currently not reached. we could re-init the parser and
 		 * start over
 		 */
+		printf("re-initializing parser\n");
+		printf(">>>>>> CUT HERE <<<<<<<\n");
+		fprintf(stderr, "re-initializing parser\n");
 		init_parser(p);
+		parse_frame(p, pbuf, len);
+		return;
 	}
 	len = (len - 2) / 4;
 	/* bring into host byte order */
@@ -632,8 +663,18 @@ output(parser_t *p, uint64_t systime, int mtype, int n, value_t *values_in)
 
 	RB_INSERT(betree, &behead, be);
 
-	if (systime > p->newest_systime)
+	if (systime > p->newest_systime) {
+		if (p->newest_systime != 0 &&
+		    systime - p->newest_systime > RETENTION_CYCLES) {
+			report("%ld big jump in systime by %ld\n", systime,
+				systime - p->newest_systime);
+		}
 		p->newest_systime = systime;
+	}
+
+	if (systime < p->newest_delivered)
+		report("%ld output arrived already after delay phase by %ld\n",
+			systime, p->newest_delivered - systime);
 
 	while (1) {
 		be = RB_MIN(betree, &behead);
@@ -642,6 +683,8 @@ output(parser_t *p, uint64_t systime, int mtype, int n, value_t *values_in)
 			break;
 
 		RB_REMOVE(betree, &behead, be);
+
+		p->newest_delivered = be->systime;
 
 		output_be(p, be);
 	}
@@ -659,6 +702,7 @@ usage(void)
 	printf("       -q          : quiet, no direct output\n");
 	printf("       -1          : feed to model 1\n");
 	printf("       -u          : unsorted, don't sort by timestamp\n");
+	printf("       -i          : re-init state on a frame-seq reset\n");
 	exit(1);
 }
 
@@ -676,7 +720,7 @@ main(int argc, char **argv)
 	int ret;
 	parser_t parser;
 
-	while ((c = getopt(argc, argv, "w:r:vuq12h?")) != EOF) {
+	while ((c = getopt(argc, argv, "w:r:vuq12ih?")) != EOF) {
 		switch(c) {
 		case 'w':
 			wrname = optarg;
@@ -693,12 +737,15 @@ main(int argc, char **argv)
 		case 'q':
 			do_output = 0;
 			break;
+		case 'i':
+			re_init_allowed = 1;
+			break;
 		case '1':
-			mctx[nmodels] = init_model1(verbose);
+			mctx[nmodels] = init_model1(&parser, verbose);
 			models[nmodels++] = model1;
 			break;
 		case '2':
-			mctx[nmodels] = init_model2(verbose);
+			mctx[nmodels] = init_model2(&parser, verbose);
 			models[nmodels++] = model2;
 			break;
 		case 'h':

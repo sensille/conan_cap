@@ -10,7 +10,8 @@ typedef unsigned long __uintptr_t;
 #define NAS5311	3
 
 typedef struct _model {
-	int		sig_prev_data; 
+	struct _parser	*parser;
+	int		sig_prev_data;
 	int		sig_first;
 } model_t;
 
@@ -21,9 +22,10 @@ static int verbose = 0;
 #define lD(...) if (verbose) printf(__VA_ARGS__)
 
 void *
-init_model2(int verb)
+init_model2(struct _parser *p, int verb)
 {
 	model_t *m = calloc(sizeof(*m), 1);
+	m->parser = p;
 
 	verbose = verb;
 
@@ -61,7 +63,7 @@ mod_signal(model_t *m, buffer_elem_t *be)
 		return;
 
 	if (m->sig_first) {
-		m->sig_prev_data = data; 
+		m->sig_prev_data = data;
 		m->sig_first = 0;
 	}
 	/*

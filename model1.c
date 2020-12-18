@@ -7,26 +7,66 @@ typedef unsigned long __uintptr_t;
 #include "tree.h"
 #include "models.h"
 
-#define NAS5311	3
-#define NSTEP	6
+#define NAS5311		3
+#define NSTEP		6
 #define NENDSTOP	4
 
-typedef struct _model {
-	int		as5311_pos_lo[NAS5311];
-	int		as5311_pos_hi[NAS5311];
-	double		as5311_pos[NAS5311];
-	int		sig_prev_data; 
-	int		sig_first;
-	int		sig_steppos[NSTEP];
-	uint64_t	sig_last_step_change[NSTEP];
-	uint64_t	sig_endstop_time_valid[NENDSTOP];
+/*
+ * 270mm z
+ * 1/8 z 1.5mm 200
+ * 1/32 x/y 32mm 400
+ */
+#define X_HOME	-12
+#define Y_HOME	0
+#define Z_HOME	270
+#define Z_STEPS_PER_MM (200.0 * 8 / 1.5)
+#if 0
+#define XY_STEPS_PER_MM (400.0 * 32 / 32.0)
+#else
+#define XY_STEPS_PER_MM (1/0.0024921)
+#endif
+
+struct _model;
+struct _mcu_ch;
+
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
+
+typedef struct _mcu_ch {
 	int		mc_state;
 	int		mc_len;
 	int		mc_off;
 	uint8_t		mc_buf[256];
+	void		(*packet)(struct _model *m, struct _mcu_ch *mc, buffer_elem_t *be);
+	int		mc_next_seq;
+} mcu_ch_t;
+
+typedef struct _model {
+	struct _parser	*parser;
+	int		changed;
+	int		as5311_pos_lo[NAS5311];
+	int		as5311_pos_hi[NAS5311];
+	double		as5311_pos[NAS5311];
+	uint32_t	sig_prev_data;
+	int		sig_first;
+	int		sig_steppos[NSTEP];
+	uint64_t	sig_last_step_change[NSTEP];
+	mcu_ch_t	mcu_ch[2];
+	uint64_t	endstop_last_change[NENDSTOP];
+	uint64_t	endstop_arm[NENDSTOP];
+	int		endstop_sample_count[NENDSTOP];
+	int		endstop_pin_value[NENDSTOP];
+	uint64_t	endstop_time_valid[NENDSTOP];
+	int		endstop_state[NENDSTOP];
+	int		step_disable[NENDSTOP];		/* during homing */
+	uint32_t	stepper_endstops[NSTEP];
+	int		home_x_stepper_x;
+	int		home_x_stepper_y;
+	int		home_y_stepper_x;
+	int		home_y_stepper_y;
+	int		home_z[3];
+	double		home_as[3];
 } model_t;
 
-#define SIG_ENDSTOP_CYCLES	2880
 #define MAX_TIME ((uint64_t)(-1ll))
 
 static void mod_signal(model_t *m, buffer_elem_t *be);
@@ -34,23 +74,37 @@ static void mod_as5311(model_t *m, buffer_elem_t *be);
 static void mod_mcu(model_t *m, buffer_elem_t *be);
 static void sig_tick(model_t *m, buffer_elem_t *be);
 static int verbose = 0;
+static void mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be);
+static void mod_packet_tx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be);
 
 #define lD(...) if (verbose) printf(__VA_ARGS__)
 
 void *
-init_model1(int verb)
+init_model1(struct _parser *p, int verb)
 {
 	model_t *m = calloc(sizeof(*m), 1);
 	int i;
 
 	verbose = verb;
+	m->parser = p;
 
 	for (i = 0; i < NAS5311; ++i)
 		m->as5311_pos_lo[i] = -1;
-	for (i = 0; i < NENDSTOP; ++i)
-		m->sig_endstop_time_valid[i] = MAX_TIME;
 
 	m->sig_first = 1;
+
+	m->mcu_ch[0].packet = mod_packet_tx;
+	m->mcu_ch[1].packet = mod_packet_rx;
+	m->mcu_ch[0].mc_next_seq = -1;
+	m->mcu_ch[1].mc_next_seq = -1;
+
+	/* which stepper reacts on which endstops */
+	m->stepper_endstops[0] = 12; /* Z: endstop3, bltouch */
+	m->stepper_endstops[1] = 12;
+	m->stepper_endstops[2] = 12;
+	m->stepper_endstops[3] = 0; /* E: none */
+	m->stepper_endstops[4] = 3; /* Y: endstop2 */
+	m->stepper_endstops[5] = 3; /* X: endstop1 */
 
 	return m;
 }
@@ -59,6 +113,8 @@ void
 model1(void *ctx, buffer_elem_t *be)
 {
 	model_t *m = ctx;
+
+	m->changed = 0;
 
 	switch (be->mtype) {
 	case MT_MCU:
@@ -78,8 +134,25 @@ model1(void *ctx, buffer_elem_t *be)
 
 	sig_tick(m, be);
 
-	printf("model as[0]=%f as[1]=%f as[2]=%f\n",
-		m->as5311_pos[0], m->as5311_pos[1], m->as5311_pos[2]);
+	if (!m->changed)
+		return;
+
+	double z1 = (m->sig_steppos[0] - m->home_z[0]) / Z_STEPS_PER_MM + Z_HOME;
+	double z2 = (m->sig_steppos[1] - m->home_z[1]) / Z_STEPS_PER_MM + Z_HOME;
+	double z3 = (m->sig_steppos[2] - m->home_z[2]) / Z_STEPS_PER_MM + Z_HOME;
+	int a = m->sig_steppos[4];	/* stepper_x */
+	int b = -m->sig_steppos[3];	/* stepper_y */
+	int home_x = m->home_x_stepper_x + (-m->home_x_stepper_y);
+	int home_y = m->home_y_stepper_x - (-m->home_y_stepper_y);
+	double x = ((a + b - home_x) / 2.) / XY_STEPS_PER_MM + X_HOME;
+	double y = ((a - b - home_y) / 2.) / XY_STEPS_PER_MM + Y_HOME;
+	double as_x1 = -(m->as5311_pos[0] - m->home_as[0]) + X_HOME;
+	double as_x2 = +(m->as5311_pos[1] - m->home_as[1]) + X_HOME;
+	double as_y = m->as5311_pos[2] - m->home_as[2] + Y_HOME;
+	int e = m->sig_steppos[5];
+
+	printf("% 14ld model as[0]=%f as[1]=%f as[2]=%f x=%f y=%f z1=%f z2=%f z3=%f e=%d\n",
+		be->systime, as_x1, as_x2, as_y, x, y, z1, z2, z3, e);
 }
 
 static void
@@ -88,13 +161,14 @@ mod_signal(model_t *m, buffer_elem_t *be)
 	uint32_t data = be->values[0].ui;
 	int valid = be->values[1].ui;
 	int i;
+	int j;
 	uint32_t diff;
 
 	if (valid == 0)
 		return;
 
 	if (m->sig_first) {
-		m->sig_prev_data = data; 
+		m->sig_prev_data = data;
 		m->sig_first = 0;
 	}
 	/*
@@ -122,6 +196,10 @@ mod_signal(model_t *m, buffer_elem_t *be)
 	diff = m->sig_prev_data ^ data;
 	m->sig_prev_data = data;
 
+printf("% 14ld endstop1=%d endstop2=%d enstop3=%d endstop4=%d\n", be->systime,
+data & 0x1000, data & 0x2000, data & 0x4000, data & 0x8000);
+printf("% 14ld diff endstop1=%d endstop2=%d enstop3=%d endstop4=%d\n", be->systime,
+diff & 0x1000, diff & 0x2000, diff & 0x4000, diff & 0x8000);
 	for (i = 0; i < 5; ++i) {
 		int sbit = 1 << (2 * i);
 		int dbit = 1 << (2 * i + 1);
@@ -143,23 +221,31 @@ mod_signal(model_t *m, buffer_elem_t *be)
 
 		if ((diff & sbit) && (data & sbit)) {
 			int dir = !!(data & dbit);
+			int disable = 0;
 
-			printf("%ld step on channel %d in dir %d\n", be->systime, i, dir);
+			for (j = 0; j < NENDSTOP; ++j)
+				if ((m->stepper_endstops[i] & (1 << j)) && m->step_disable[j])
+					disable = 1;
+
+			printf("% 14ld step on channel %d in dir %d disable %d\n",
+				be->systime, i, dir, disable);
+
+			if (disable)
+				report("step after endstop triggered\n");
 
 			m->sig_last_step_change[i] = be->systime;
 			m->sig_steppos[i] += dir ? 1 : -1;
+			m->changed = 1;
 		}
 	}
-	for (i = 0; i < 3; ++i) {
+	for (i = 0; i < NENDSTOP; ++i) {
 		int ebit = 1 << (i + 12);
 		if (diff & ebit) {
 			int state = !!(data & ebit);
 
-			printf("%ld endstop %d changed state to %d\n", be->systime, i, state);
-			if (state == 0)
-				m->sig_endstop_time_valid[i] = be->systime + SIG_ENDSTOP_CYCLES;
-			else
-				m->sig_endstop_time_valid[i] = MAX_TIME;
+			printf("% 14ld endstop %d changed state to %d\n", be->systime, i, state);
+			m->endstop_last_change[i] = be->systime;
+			m->endstop_state[i] = state;
 		}
 	}
 }
@@ -168,11 +254,39 @@ static void
 sig_tick(model_t *m, buffer_elem_t *be)
 {
 	int i;
+	uint64_t start;
 
 	for (i = 0; i < NENDSTOP; ++i) {
-		if (be->systime >= m->sig_endstop_time_valid[i]) {
-			printf("%ld endstop %d valid\n", be->systime, i);
-			m->sig_endstop_time_valid[i] = MAX_TIME;
+		if (m->endstop_arm[i] == 0)
+			continue;
+
+		if (m->endstop_pin_value[i] != m->endstop_state[i])
+			continue;
+
+		start = MAX(m->endstop_last_change[i], m->endstop_arm[i]);
+
+		if (be->systime + be->n > start + m->endstop_sample_count[i]) {
+			printf("% 14ld endstop %d got valid at %ld\n", be->systime, i,
+				start + m->endstop_sample_count[i]);
+			m->endstop_time_valid[i] = start + m->endstop_sample_count[i];
+			m->endstop_arm[i] = 0;
+			m->endstop_sample_count[i] = 0;
+			m->step_disable[i] = 1;
+			/* XXX hard code for now */
+			if (i == 0) {
+				m->home_x_stepper_x = m->sig_steppos[4];
+				m->home_x_stepper_y = m->sig_steppos[3];
+				m->home_as[0] = m->as5311_pos[0];
+				m->home_as[1] = m->as5311_pos[1];
+			} else if (i == 1) {
+				m->home_y_stepper_x = m->sig_steppos[4];
+				m->home_y_stepper_y = m->sig_steppos[3];
+				m->home_as[2] = m->as5311_pos[2];
+			} else if (i == 2) {
+				m->home_z[0] = m->sig_steppos[0];
+				m->home_z[1] = m->sig_steppos[1];
+				m->home_z[2] = m->sig_steppos[2];
+			}
 		}
 	}
 }
@@ -211,6 +325,8 @@ mod_as5311(model_t *m, buffer_elem_t *be)
 	/* 4096 steps per 2mm */
 	m->as5311_pos_lo[ch] = pos;
 	m->as5311_pos[ch] = (m->as5311_pos_hi[ch] * 4096 + m->as5311_pos_lo[ch]) / 2048.;
+
+	m->changed = 1;
 }
 
 #define MS_IDLE		0
@@ -231,63 +347,341 @@ crc16_ccitt(uint8_t *buf, uint_fast8_t len)
 	return crc;
 }
 
-static void
-mod_mcu(model_t *m, buffer_elem_t *be)
+static uint8_t
+read_byte(uint8_t **b, int *len)
 {
-	int dir = strcmp(be->values[0].s, "tx");
+	if (*len == 0)
+		report("read_byte: end of packet reached\n");
+	--*len;
+
+	return *(*b)++;
+}
+
+static uint32_t
+parse_arg(uint8_t **b, int *len)
+{
+    uint8_t c = read_byte(b, len);
+    uint32_t v = c & 0x7f;
+
+    if ((c & 0x60) == 0x60)
+        v |= -0x20;
+
+    while (c & 0x80) {
+        c = read_byte(b, len);
+        v = (v<<7) | (c & 0x7f);
+    }
+
+    return v;
+}
+
+#define CMD_GET_VERSION         0
+#define CMD_SYNC_TIME           1
+#define CMD_GET_TIME            2
+#define CMD_CONFIG_PWM          3
+#define CMD_SCHEDULE_PWM        4
+#define CMD_CONFIG_STEPPER      5
+#define CMD_QUEUE_STEP          6
+#define CMD_SET_NEXT_STEP_DIR   7
+#define CMD_RESET_STEP_CLOCK    8
+#define CMD_STEPPER_GET_POS     9
+#define CMD_ENDSTOP_SET_STEPPER 10
+#define CMD_ENDSTOP_QUERY       11
+#define CMD_ENDSTOP_HOME        12
+#define CMD_TMCUART_WRITE       13
+#define CMD_TMCUART_READ        14
+#define CMD_SET_DIGITAL_OUT     15
+#define CMD_CONFIG_DIGITAL_OUT  16
+#define CMD_SCHEDULE_DIGITAL_OUT 17
+#define CMD_UPDATE_DIGITAL_OUT  18
+#define CMD_SHUTDOWN            19
+#define CMD_STEPPER_GET_NEXT    20
+#define CMD_CONFIG_DRO          21
+#define CMD_CONFIG_AS5311       22
+#define CMD_SD_QUEUE            23
+#define CMD_CONFIG_ETHER        24
+#define CMD_ETHER_MD_READ       25
+#define CMD_ETHER_MD_WRITE      26
+#define CMD_ETHER_SET_STATE     27
+#define CMD_CONFIG_SIGNAL       28
+
+static void
+mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
+{
+	uint8_t *b = mc->mc_buf + 2;
+	int len = mc->mc_off - 4;
+	
+	uint32_t type = parse_arg(&b, &len);
+
+	printf("% 14ld ", be->systime);
+
+	switch (type) {
+	case CMD_GET_VERSION:
+		printf("CMD_GET_VERSION\n");
+		break;
+	case CMD_SYNC_TIME:
+		printf("CMD_SYNC_TIME\n");
+		break;
+	case CMD_GET_TIME:
+		printf("CMD_GET_TIME\n");
+		break;
+	case CMD_CONFIG_PWM:
+		printf("CMD_CONFIG_PWM\n");
+		break;
+	case CMD_SCHEDULE_PWM: {
+		int channel = parse_arg(&b, &len);
+		uint32_t clock = parse_arg(&b, &len);
+		uint32_t on_ticks = parse_arg(&b, &len);
+		uint32_t off_ticks = parse_arg(&b, &len);
+
+		printf("CMD_SCHEDULE_PWM channel=%d clock=%u on_ticks=%u off_ticks=%u\n",
+			channel, clock, on_ticks, off_ticks);
+		break;
+	}
+	case CMD_CONFIG_STEPPER:
+		printf("CMD_CONFIG_STEPPER\n");
+		break;
+	case CMD_QUEUE_STEP: {
+		int channel = parse_arg(&b, &len);
+		uint32_t interval = parse_arg(&b, &len);
+		int32_t count = parse_arg(&b, &len);
+		uint32_t add = parse_arg(&b, &len);
+
+		printf("CMD_QUEUE_STEP channel=%d interval=%d count=%d add=%d\n",
+			channel, interval, count, add);
+		break;
+	}
+	case CMD_SET_NEXT_STEP_DIR: {
+		int channel = parse_arg(&b, &len);
+		uint32_t dir = parse_arg(&b, &len);
+
+		printf("CMD_SET_NEXT_STEP_DIR channel=%d dir=%d\n",
+			channel, dir);
+		break;
+	}
+	case CMD_RESET_STEP_CLOCK: {
+		int channel = parse_arg(&b, &len);
+		uint32_t clock = parse_arg(&b, &len);
+
+		printf("CMD_RESET_STEP_CLOCK channel=%d clock=%u\n",
+			channel, clock);
+		break;
+	}
+	case CMD_STEPPER_GET_POS: {
+		int channel = parse_arg(&b, &len);
+		printf("CMD_STEPPER_GET_POS channel=%d\n", channel);
+		break;
+	}
+	case CMD_ENDSTOP_SET_STEPPER:
+		printf("CMD_ENDSTOP_SET_STEPPER\n");
+		break;
+	case CMD_ENDSTOP_QUERY: {
+		int channel = parse_arg(&b, &len);
+		printf("CMD_ENDSTOP_QUERY channel=%d\n", channel);
+		break;
+	}
+	case CMD_ENDSTOP_HOME: {
+		int channel = parse_arg(&b, &len);
+		uint32_t clock = parse_arg(&b, &len);
+		uint32_t sample_count = parse_arg(&b, &len);
+		uint32_t pin_value = parse_arg(&b, &len);
+		uint64_t systime = clock ? relate_systime(m->parser, clock, 32) : 0;
+
+		printf("CMD_ENDSTOP_HOME channel=%d clock=%u (%ld) sample_count=%d pin_value=%d\n",
+			channel, clock, systime, sample_count, pin_value);
+
+		if (sample_count == 0) {
+			m->endstop_arm[channel] = 0;
+			m->endstop_sample_count[channel] = 0;
+			m->step_disable[channel] = 0;
+		} else {
+			m->endstop_arm[channel] = systime;
+			m->endstop_sample_count[channel] = sample_count;
+		}
+		m->endstop_pin_value[channel] = pin_value;
+
+		break;
+	}
+	case CMD_TMCUART_WRITE:
+		printf("CMD_TMCUART_WRITE\n");
+		break;
+	case CMD_TMCUART_READ:
+		printf("CMD_TMCUART_READ\n");
+		break;
+	case CMD_SET_DIGITAL_OUT:
+		printf("CMD_SET_DIGITAL_OUT\n");
+		break;
+	case CMD_CONFIG_DIGITAL_OUT:
+		printf("CMD_CONFIG_DIGITAL_OUT\n");
+		break;
+	case CMD_SCHEDULE_DIGITAL_OUT:
+		printf("CMD_SCHEDULE_DIGITAL_OUT\n");
+		break;
+	case CMD_UPDATE_DIGITAL_OUT:
+		printf("CMD_UPDATE_DIGITAL_OUT\n");
+		break;
+	case CMD_SHUTDOWN:
+		printf("CMD_SHUTDOWN\n");
+		break;
+	case CMD_STEPPER_GET_NEXT:
+		printf("CMD_STEPPER_GET_NEXT\n");
+		break;
+	case CMD_CONFIG_DRO:
+		printf("CMD_CONFIG_DRO\n");
+		break;
+	case CMD_CONFIG_AS5311:
+		printf("CMD_CONFIG_AS5311\n");
+		break;
+	case CMD_SD_QUEUE:
+		printf("CMD_SD_QUEUE\n");
+		break;
+	case CMD_CONFIG_ETHER:
+		printf("CMD_CONFIG_ETHER\n");
+		break;
+	case CMD_ETHER_MD_READ:
+		printf("CMD_ETHER_MD_READ\n");
+		break;
+	case CMD_ETHER_MD_WRITE:
+		printf("CMD_ETHER_MD_WRITE\n");
+		break;
+	case CMD_ETHER_SET_STATE:
+		printf("CMD_ETHER_SET_STATE\n");
+		break;
+	case CMD_CONFIG_SIGNAL:
+		printf("CMD_CONFIG_SIGNAL\n");
+		break;
+	default:
+		printf("unkown command\n");
+		break;
+	}
+}
+
+#define RSP_GET_VERSION         0
+#define RSP_GET_TIME            1
+#define RSP_STEPPER_GET_POS     2
+#define RSP_ENDSTOP_STATE       3
+#define RSP_TMCUART_READ        4
+#define RSP_SHUTDOWN            5
+#define RSP_STEPPER_GET_NEXT    6
+#define RSP_DRO_DATA            7
+#define RSP_AS5311_DATA         8
+#define RSP_SD_CMDQ             9
+#define RSP_SD_DATQ            10
+#define RSP_ETHER_MD_READ      11
+
+static void
+mod_packet_tx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
+{
+	uint8_t *b = mc->mc_buf + 2;
+	int len = mc->mc_off - 4;
+	
+	uint32_t type = parse_arg(&b, &len);
+
+	printf("% 14ld ", be->systime);
+
+	switch (type) {
+	case RSP_GET_VERSION:
+		printf("RSP_GET_VERSION\n");
+		break;
+	case RSP_GET_TIME:
+		printf("RSP_GET_TIME\n");
+		break;
+	case RSP_STEPPER_GET_POS: {
+		int channel = parse_arg(&b, &len);
+		int32_t pos = parse_arg(&b, &len);
+
+		printf("RSP_STEPPER_GET_POS channel=%d pos=%d\n", channel, pos );
+		break;
+	}
+	case RSP_ENDSTOP_STATE: {
+		int channel = parse_arg(&b, &len);
+		uint32_t homing = parse_arg(&b, &len);
+		uint32_t pin_value = parse_arg(&b, &len);
+		printf("RSP_ENDSTOP_STATE channel=%d homing=%d pin_value=%d\n",
+			channel, homing, pin_value);
+		break;
+	}
+	case RSP_TMCUART_READ:
+		printf("RSP_TMCUART_READ\n");
+		break;
+	case RSP_SHUTDOWN:
+		printf("RSP_SHUTDOWN\n");
+		break;
+	case RSP_STEPPER_GET_NEXT:
+		printf("RSP_STEPPER_GET_NEXT\n");
+		break;
+	case RSP_DRO_DATA:
+		printf("RSP_DRO_DATA\n");
+		break;
+	case RSP_AS5311_DATA:
+		printf("RSP_AS5311_DATA\n");
+		break;
+	case RSP_SD_CMDQ:
+		printf("RSP_SD_CMDQ\n");
+		break;
+	case RSP_SD_DATQ:
+		printf("RSP_SD_DATQ\n");
+		break;
+	case RSP_ETHER_MD_READ:
+		printf("RSP_ETHER_MD_READ\n");
+		break;
+	}
+}
+
+static void
+mod_mcu_ch(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
+{
 	uint8_t data = be->values[1].ui;
 
-	/* don't parse tx yet */
-	if (dir == 0)
-		return;
-
-printf("%14ld rx %02x\n", be->systime, data);
 	/* find frame */
-	if (m->mc_state == MS_IDLE) {
+	if (mc->mc_state == MS_IDLE) {
 		if (data == 0x7e) {
 			/* ignore */
 			return;
 		}
-		if (data < 3) {
-#if 0
+		if (data < 3)
 			report("data too small\n");
-#else
-			printf("data too small\n");
-			data = 3;
-#endif
-		}
-		m->mc_len = data - 2;
-		m->mc_off = 0;
-		m->mc_buf[m->mc_off++] = data;
-		m->mc_state = MS_IN_PACKET;
-	} else if (m->mc_state == MS_IN_PACKET) {
-		m->mc_buf[m->mc_off++] = data;
-		if (--m->mc_len == 0)
-			m->mc_state = MS_EOP;
-	} else if (m->mc_state == MS_EOP) {
+		mc->mc_len = data - 2;
+		mc->mc_off = 0;
+		mc->mc_buf[mc->mc_off++] = data;
+		mc->mc_state = MS_IN_PACKET;
+	} else if (mc->mc_state == MS_IN_PACKET) {
+		mc->mc_buf[mc->mc_off++] = data;
+		if (--mc->mc_len == 0)
+			mc->mc_state = MS_EOP;
+	} else if (mc->mc_state == MS_EOP) {
 		uint16_t crc;
 
 		if (data != 0x7e)
-#if 0
 			report("%ld end of packet not found\n", be->systime);
-#else
-			printf("%ld end of packet not found\n", be->systime);
-#endif
-		/* check crc */
-		crc = crc16_ccitt(m->mc_buf, m->mc_off - 2);
-		if (crc != m->mc_buf[m->mc_off - 2] * 256 +
-			m->mc_buf[m->mc_off - 1])
-#if 0
-			report("bad crc in mcu packet\n");
-#else
-			printf("%ld bad crc in mcu packet\n", be->systime);
-#endif
-#if 1
-		printf("crc %04x buf %02x %02x\n", crc,
-			m->mc_buf[m->mc_off - 2],
-			m->mc_buf[m->mc_off - 1]);
-#endif
 
-		m->mc_state = MS_IDLE;
+		/* check crc */
+		crc = crc16_ccitt(mc->mc_buf, mc->mc_off - 2);
+		if (crc != mc->mc_buf[mc->mc_off - 2] * 256 +
+			mc->mc_buf[mc->mc_off - 1])
+			report("bad crc in mcu packet\n");
+
+		/* check seq */
+		if ((mc->mc_buf[1] & 0xf0) != 0x10)
+			report("invalid seq marker in packet\n");
+
+		if (mc->mc_next_seq == -1)
+			mc->mc_next_seq = mc->mc_buf[1] & 0x0f;
+
+		if ((mc->mc_buf[1] & 0x0f) != mc->mc_next_seq)
+			report("invalid seq in packet\n");
+
+		mc->mc_next_seq = (mc->mc_next_seq + 1) & 0x0f;
+
+		mc->packet(m, mc, be);
+
+		mc->mc_state = MS_IDLE;
 	}
+}
+
+static void
+mod_mcu(model_t *m, buffer_elem_t *be)
+{
+	int dir = !!strcmp(be->values[0].s, "tx");
+
+	mod_mcu_ch(m, &m->mcu_ch[dir], be);
 }
