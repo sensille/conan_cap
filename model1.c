@@ -11,6 +11,8 @@ typedef unsigned long __uintptr_t;
 #define NSTEP		6
 #define NENDSTOP	4
 
+#define HZ 48000000
+
 /*
  * 270mm z
  * 1/8 z 1.5mm 200
@@ -65,6 +67,7 @@ typedef struct _model {
 	int		home_y_stepper_y;
 	int		home_z[3];
 	double		home_as[3];
+	uint64_t	first_systime;
 } model_t;
 
 #define MAX_TIME ((uint64_t)(-1ll))
@@ -151,8 +154,15 @@ model1(void *ctx, buffer_elem_t *be)
 	double as_y = m->as5311_pos[2] - m->home_as[2] + Y_HOME;
 	int e = m->sig_steppos[5];
 
+	if (m->first_systime == 0)
+		m->first_systime = be->systime;
+
 	printf("% 14ld model as[0]=%f as[1]=%f as[2]=%f x=%f y=%f z1=%f z2=%f z3=%f e=%d\n",
 		be->systime, as_x1, as_x2, as_y, x, y, z1, z2, z3, e);
+	printf("% 8.9f DATA as %f %f %f x/y %f %f z %f %f %f e %d delta_as %f dx_as1 %f dx_as2 %f dy_as %f\n",
+		(double)(be->systime - m->first_systime) / HZ,
+		as_x1, as_x2, as_y, x, y, z1, z2, z3, e,
+		as_x1 - as_x2, x - as_x1, x - as_x2, y - as_y);
 }
 
 static void
