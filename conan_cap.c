@@ -286,9 +286,6 @@ relate_systime(parser_t *p, uint64_t systime, int bits)
 	rel = (p->systime_base & ~((1ull << bits) - 1)) | systime;
 	if (s2 == 0 && s1 == 3)
 		rel -= (1ull << bits);
-#if 0
-printf("relate: s1 %d s2 %d systime %lx base %lx rel %lx %ld\n", s1, s2, systime, p->systime_base, rel, rel);
-#endif
 
 	return rel;
 }

@@ -13,6 +13,11 @@ typedef unsigned long __uintptr_t;
 
 #define HZ 48000000
 
+#define CHG_AS_X1	1
+#define CHG_AS_X2	2
+#define CHG_AS_Y	4
+#define CHG_STEP	8
+
 /*
  * 270mm z
  * 1/8 z 1.5mm 200
@@ -68,6 +73,9 @@ typedef struct _model {
 	int		home_z[3];
 	double		home_as[3];
 	uint64_t	first_systime;
+	int		chg_mask;
+	double		chg_x;
+	double		chg_y;
 } model_t;
 
 #define MAX_TIME ((uint64_t)(-1ll))
@@ -157,12 +165,27 @@ model1(void *ctx, buffer_elem_t *be)
 	if (m->first_systime == 0)
 		m->first_systime = be->systime;
 
-	printf("% 14ld model as[0]=%f as[1]=%f as[2]=%f x=%f y=%f z1=%f z2=%f z3=%f e=%d\n",
+	lD("% 14ld model as[0]=%f as[1]=%f as[2]=%f x=%f y=%f z1=%f z2=%f z3=%f e=%d\n",
 		be->systime, as_x1, as_x2, as_y, x, y, z1, z2, z3, e);
-	printf("% 8.9f DATA as %f %f %f x/y %f %f z %f %f %f e %d delta_as %f dx_as1 %f dx_as2 %f dy_as %f\n",
+#if 0
+	printf("% 8.9f DATA chg %d as %f %f %f x/y %f %f z %f %f %f e %d delta_as %f dx_as1 %f dx_as2 %f dy_as %f\n",
 		(double)(be->systime - m->first_systime) / HZ,
+		m->changed,
 		as_x1, as_x2, as_y, x, y, z1, z2, z3, e,
 		as_x1 - as_x2, x - as_x1, x - as_x2, y - as_y);
+#endif
+	m->chg_mask |= m->changed;
+	if ((m->chg_mask & 7) == 7) {
+		/* all as5311 seen, emit one line */
+		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f e %d\n",
+			(double)(be->systime - m->first_systime) / HZ,
+			as_x1, as_x2, as_y,
+			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
+			z1, z2, z3, e);
+		m->chg_x = x;
+		m->chg_y = y;
+		m->chg_mask = 0;
+	}
 }
 
 static void
@@ -206,10 +229,6 @@ mod_signal(model_t *m, buffer_elem_t *be)
 	diff = m->sig_prev_data ^ data;
 	m->sig_prev_data = data;
 
-printf("% 14ld endstop1=%d endstop2=%d enstop3=%d endstop4=%d\n", be->systime,
-data & 0x1000, data & 0x2000, data & 0x4000, data & 0x8000);
-printf("% 14ld diff endstop1=%d endstop2=%d enstop3=%d endstop4=%d\n", be->systime,
-diff & 0x1000, diff & 0x2000, diff & 0x4000, diff & 0x8000);
 	for (i = 0; i < 5; ++i) {
 		int sbit = 1 << (2 * i);
 		int dbit = 1 << (2 * i + 1);
@@ -237,7 +256,7 @@ diff & 0x1000, diff & 0x2000, diff & 0x4000, diff & 0x8000);
 				if ((m->stepper_endstops[i] & (1 << j)) && m->step_disable[j])
 					disable = 1;
 
-			printf("% 14ld step on channel %d in dir %d disable %d\n",
+			lD("% 14ld step on channel %d in dir %d disable %d\n",
 				be->systime, i, dir, disable);
 
 			if (disable)
@@ -245,7 +264,7 @@ diff & 0x1000, diff & 0x2000, diff & 0x4000, diff & 0x8000);
 
 			m->sig_last_step_change[i] = be->systime;
 			m->sig_steppos[i] += dir ? 1 : -1;
-			m->changed = 1;
+			m->changed |= CHG_STEP;
 		}
 	}
 	for (i = 0; i < NENDSTOP; ++i) {
@@ -253,7 +272,7 @@ diff & 0x1000, diff & 0x2000, diff & 0x4000, diff & 0x8000);
 		if (diff & ebit) {
 			int state = !!(data & ebit);
 
-			printf("% 14ld endstop %d changed state to %d\n", be->systime, i, state);
+			lD("% 14ld endstop %d changed state to %d\n", be->systime, i, state);
 			m->endstop_last_change[i] = be->systime;
 			m->endstop_state[i] = state;
 		}
@@ -276,13 +295,15 @@ sig_tick(model_t *m, buffer_elem_t *be)
 		start = MAX(m->endstop_last_change[i], m->endstop_arm[i]);
 
 		if (be->systime + be->n > start + m->endstop_sample_count[i]) {
-			printf("% 14ld endstop %d got valid at %ld\n", be->systime, i,
+			lD("% 14ld endstop %d got valid at %ld\n", be->systime, i,
 				start + m->endstop_sample_count[i]);
 			m->endstop_time_valid[i] = start + m->endstop_sample_count[i];
 			m->endstop_arm[i] = 0;
 			m->endstop_sample_count[i] = 0;
 			m->step_disable[i] = 1;
 			/* XXX hard code for now */
+			printf("% 8.9f HOME endstop %d\n",
+				(double)(be->systime - m->first_systime) / HZ, i);
 			if (i == 0) {
 				m->home_x_stepper_x = m->sig_steppos[4];
 				m->home_x_stepper_y = m->sig_steppos[3];
@@ -336,7 +357,12 @@ mod_as5311(model_t *m, buffer_elem_t *be)
 	m->as5311_pos_lo[ch] = pos;
 	m->as5311_pos[ch] = (m->as5311_pos_hi[ch] * 4096 + m->as5311_pos_lo[ch]) / 2048.;
 
-	m->changed = 1;
+	if (ch == 0)
+		m->changed |= CHG_AS_X1;
+	else if (ch == 1)
+		m->changed |= CHG_AS_X2;
+	else if (ch == 2)
+		m->changed |= CHG_AS_Y;
 }
 
 #define MS_IDLE		0
@@ -422,20 +448,20 @@ mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 	
 	uint32_t type = parse_arg(&b, &len);
 
-	printf("% 14ld ", be->systime);
+	lD("% 14ld ", be->systime);
 
 	switch (type) {
 	case CMD_GET_VERSION:
-		printf("CMD_GET_VERSION\n");
+		lD("CMD_GET_VERSION\n");
 		break;
 	case CMD_SYNC_TIME:
-		printf("CMD_SYNC_TIME\n");
+		lD("CMD_SYNC_TIME\n");
 		break;
 	case CMD_GET_TIME:
-		printf("CMD_GET_TIME\n");
+		lD("CMD_GET_TIME\n");
 		break;
 	case CMD_CONFIG_PWM:
-		printf("CMD_CONFIG_PWM\n");
+		lD("CMD_CONFIG_PWM\n");
 		break;
 	case CMD_SCHEDULE_PWM: {
 		int channel = parse_arg(&b, &len);
@@ -443,12 +469,12 @@ mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 		uint32_t on_ticks = parse_arg(&b, &len);
 		uint32_t off_ticks = parse_arg(&b, &len);
 
-		printf("CMD_SCHEDULE_PWM channel=%d clock=%u on_ticks=%u off_ticks=%u\n",
+		lD("CMD_SCHEDULE_PWM channel=%d clock=%u on_ticks=%u off_ticks=%u\n",
 			channel, clock, on_ticks, off_ticks);
 		break;
 	}
 	case CMD_CONFIG_STEPPER:
-		printf("CMD_CONFIG_STEPPER\n");
+		lD("CMD_CONFIG_STEPPER\n");
 		break;
 	case CMD_QUEUE_STEP: {
 		int channel = parse_arg(&b, &len);
@@ -456,7 +482,7 @@ mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 		int32_t count = parse_arg(&b, &len);
 		uint32_t add = parse_arg(&b, &len);
 
-		printf("CMD_QUEUE_STEP channel=%d interval=%d count=%d add=%d\n",
+		lD("CMD_QUEUE_STEP channel=%d interval=%d count=%d add=%d\n",
 			channel, interval, count, add);
 		break;
 	}
@@ -464,7 +490,7 @@ mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 		int channel = parse_arg(&b, &len);
 		uint32_t dir = parse_arg(&b, &len);
 
-		printf("CMD_SET_NEXT_STEP_DIR channel=%d dir=%d\n",
+		lD("CMD_SET_NEXT_STEP_DIR channel=%d dir=%d\n",
 			channel, dir);
 		break;
 	}
@@ -472,21 +498,21 @@ mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 		int channel = parse_arg(&b, &len);
 		uint32_t clock = parse_arg(&b, &len);
 
-		printf("CMD_RESET_STEP_CLOCK channel=%d clock=%u\n",
+		lD("CMD_RESET_STEP_CLOCK channel=%d clock=%u\n",
 			channel, clock);
 		break;
 	}
 	case CMD_STEPPER_GET_POS: {
 		int channel = parse_arg(&b, &len);
-		printf("CMD_STEPPER_GET_POS channel=%d\n", channel);
+		lD("CMD_STEPPER_GET_POS channel=%d\n", channel);
 		break;
 	}
 	case CMD_ENDSTOP_SET_STEPPER:
-		printf("CMD_ENDSTOP_SET_STEPPER\n");
+		lD("CMD_ENDSTOP_SET_STEPPER\n");
 		break;
 	case CMD_ENDSTOP_QUERY: {
 		int channel = parse_arg(&b, &len);
-		printf("CMD_ENDSTOP_QUERY channel=%d\n", channel);
+		lD("CMD_ENDSTOP_QUERY channel=%d\n", channel);
 		break;
 	}
 	case CMD_ENDSTOP_HOME: {
@@ -496,7 +522,7 @@ mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 		uint32_t pin_value = parse_arg(&b, &len);
 		uint64_t systime = clock ? relate_systime(m->parser, clock, 32) : 0;
 
-		printf("CMD_ENDSTOP_HOME channel=%d clock=%u (%ld) sample_count=%d pin_value=%d\n",
+		lD("CMD_ENDSTOP_HOME channel=%d clock=%u (%ld) sample_count=%d pin_value=%d\n",
 			channel, clock, systime, sample_count, pin_value);
 
 		if (sample_count == 0) {
@@ -512,55 +538,55 @@ mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 		break;
 	}
 	case CMD_TMCUART_WRITE:
-		printf("CMD_TMCUART_WRITE\n");
+		lD("CMD_TMCUART_WRITE\n");
 		break;
 	case CMD_TMCUART_READ:
-		printf("CMD_TMCUART_READ\n");
+		lD("CMD_TMCUART_READ\n");
 		break;
 	case CMD_SET_DIGITAL_OUT:
-		printf("CMD_SET_DIGITAL_OUT\n");
+		lD("CMD_SET_DIGITAL_OUT\n");
 		break;
 	case CMD_CONFIG_DIGITAL_OUT:
-		printf("CMD_CONFIG_DIGITAL_OUT\n");
+		lD("CMD_CONFIG_DIGITAL_OUT\n");
 		break;
 	case CMD_SCHEDULE_DIGITAL_OUT:
-		printf("CMD_SCHEDULE_DIGITAL_OUT\n");
+		lD("CMD_SCHEDULE_DIGITAL_OUT\n");
 		break;
 	case CMD_UPDATE_DIGITAL_OUT:
-		printf("CMD_UPDATE_DIGITAL_OUT\n");
+		lD("CMD_UPDATE_DIGITAL_OUT\n");
 		break;
 	case CMD_SHUTDOWN:
-		printf("CMD_SHUTDOWN\n");
+		lD("CMD_SHUTDOWN\n");
 		break;
 	case CMD_STEPPER_GET_NEXT:
-		printf("CMD_STEPPER_GET_NEXT\n");
+		lD("CMD_STEPPER_GET_NEXT\n");
 		break;
 	case CMD_CONFIG_DRO:
-		printf("CMD_CONFIG_DRO\n");
+		lD("CMD_CONFIG_DRO\n");
 		break;
 	case CMD_CONFIG_AS5311:
-		printf("CMD_CONFIG_AS5311\n");
+		lD("CMD_CONFIG_AS5311\n");
 		break;
 	case CMD_SD_QUEUE:
-		printf("CMD_SD_QUEUE\n");
+		lD("CMD_SD_QUEUE\n");
 		break;
 	case CMD_CONFIG_ETHER:
-		printf("CMD_CONFIG_ETHER\n");
+		lD("CMD_CONFIG_ETHER\n");
 		break;
 	case CMD_ETHER_MD_READ:
-		printf("CMD_ETHER_MD_READ\n");
+		lD("CMD_ETHER_MD_READ\n");
 		break;
 	case CMD_ETHER_MD_WRITE:
-		printf("CMD_ETHER_MD_WRITE\n");
+		lD("CMD_ETHER_MD_WRITE\n");
 		break;
 	case CMD_ETHER_SET_STATE:
-		printf("CMD_ETHER_SET_STATE\n");
+		lD("CMD_ETHER_SET_STATE\n");
 		break;
 	case CMD_CONFIG_SIGNAL:
-		printf("CMD_CONFIG_SIGNAL\n");
+		lD("CMD_CONFIG_SIGNAL\n");
 		break;
 	default:
-		printf("unkown command\n");
+		lD("unkown command\n");
 		break;
 	}
 }
@@ -586,53 +612,53 @@ mod_packet_tx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be)
 	
 	uint32_t type = parse_arg(&b, &len);
 
-	printf("% 14ld ", be->systime);
+	lD("% 14ld ", be->systime);
 
 	switch (type) {
 	case RSP_GET_VERSION:
-		printf("RSP_GET_VERSION\n");
+		lD("RSP_GET_VERSION\n");
 		break;
 	case RSP_GET_TIME:
-		printf("RSP_GET_TIME\n");
+		lD("RSP_GET_TIME\n");
 		break;
 	case RSP_STEPPER_GET_POS: {
 		int channel = parse_arg(&b, &len);
 		int32_t pos = parse_arg(&b, &len);
 
-		printf("RSP_STEPPER_GET_POS channel=%d pos=%d\n", channel, pos );
+		lD("RSP_STEPPER_GET_POS channel=%d pos=%d\n", channel, pos );
 		break;
 	}
 	case RSP_ENDSTOP_STATE: {
 		int channel = parse_arg(&b, &len);
 		uint32_t homing = parse_arg(&b, &len);
 		uint32_t pin_value = parse_arg(&b, &len);
-		printf("RSP_ENDSTOP_STATE channel=%d homing=%d pin_value=%d\n",
+		lD("RSP_ENDSTOP_STATE channel=%d homing=%d pin_value=%d\n",
 			channel, homing, pin_value);
 		break;
 	}
 	case RSP_TMCUART_READ:
-		printf("RSP_TMCUART_READ\n");
+		lD("RSP_TMCUART_READ\n");
 		break;
 	case RSP_SHUTDOWN:
-		printf("RSP_SHUTDOWN\n");
+		lD("RSP_SHUTDOWN\n");
 		break;
 	case RSP_STEPPER_GET_NEXT:
-		printf("RSP_STEPPER_GET_NEXT\n");
+		lD("RSP_STEPPER_GET_NEXT\n");
 		break;
 	case RSP_DRO_DATA:
-		printf("RSP_DRO_DATA\n");
+		lD("RSP_DRO_DATA\n");
 		break;
 	case RSP_AS5311_DATA:
-		printf("RSP_AS5311_DATA\n");
+		lD("RSP_AS5311_DATA\n");
 		break;
 	case RSP_SD_CMDQ:
-		printf("RSP_SD_CMDQ\n");
+		lD("RSP_SD_CMDQ\n");
 		break;
 	case RSP_SD_DATQ:
-		printf("RSP_SD_DATQ\n");
+		lD("RSP_SD_DATQ\n");
 		break;
 	case RSP_ETHER_MD_READ:
-		printf("RSP_ETHER_MD_READ\n");
+		lD("RSP_ETHER_MD_READ\n");
 		break;
 	}
 }
