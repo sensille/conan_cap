@@ -76,6 +76,7 @@ typedef struct _model {
 	int		chg_mask;
 	double		chg_x;
 	double		chg_y;
+	uint64_t	chg_t;
 } model_t;
 
 #define MAX_TIME ((uint64_t)(-1ll))
@@ -178,12 +179,13 @@ model1(void *ctx, buffer_elem_t *be)
 	if ((m->chg_mask & 7) == 7) {
 		/* all as5311 seen, emit one line */
 		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f e %d\n",
-			(double)(be->systime - m->first_systime) / HZ,
+			(double)((be->systime + m->chg_t) / 2 - m->first_systime) / HZ,
 			as_x1, as_x2, as_y,
 			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
 			z1, z2, z3, e);
 		m->chg_x = x;
 		m->chg_y = y;
+		m->chg_t = be->systime;
 		m->chg_mask = 0;
 	}
 }

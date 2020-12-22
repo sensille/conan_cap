@@ -44,12 +44,12 @@ my $as_y_rptr = 0;
 while (<FH>) {
 	next unless (/^\s*([\d.]+)\s/);
 
-	if (/^\s*([\d.]+)\s+CMPL chg (\d+) as (\S+) (\S+) (\S+) x.y (\S+) (\S+) z (\S+) (\S+) (\S+) e (\S+)$/) {
-		my ($ts, $chg, $as_x1, $as_x2, $as_y, $x, $y, $z1, $z2, $z3, $e) =
+	if (/^\s*([\d.]+)\s+CMPL as (\S+) (\S+) (\S+) x.y (\S+) (\S+) z (\S+) (\S+) (\S+) e (\S+)$/) {
+		my ($ts, $as_x1, $as_x2, $as_y, $x, $y, $z1, $z2, $z3, $e) =
 			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
 		if ($state eq "wait_z") {
-			# wait for z to reach <= 200
-			if ($z1 < 201) {
+			# wait for z to reach <= 250
+			if ($z1 < 251) {
 				print("z reached\n");
 				$state = "wait_idle";
 				$idle_start = undef;
@@ -80,23 +80,19 @@ while (<FH>) {
 			}
 		}
 		# avg of 5 for as, delay x/y by 2 slots to get in the middle
-		if ($chg & 1) {
+		if (0) {
 			$as_x1_avg -= $as_x1_ring[$as_x1_rptr];
 			$as_x1_avg += $as_x1;
 			$as_x1_ring[$as_x1_rptr] = $as_x1;
 			if (++$as_x1_rptr == 5) {
 				$as_x1_rptr = 0;
 			}
-		}
-		if ($chg & 2) {
 			$as_x2_avg -= $as_x2_ring[$as_x2_rptr];
 			$as_x2_avg += $as_x2;
 			$as_x2_ring[$as_x2_rptr] = $as_x2;
 			if (++$as_x2_rptr == 5) {
 				$as_x2_rptr = 0;
 			}
-		}
-		if ($chg & 4) {
 			$as_y_avg -= $as_y_ring[$as_y_rptr];
 			$as_y_avg += $as_y;
 			$as_y_ring[$as_y_rptr] = $as_y;
@@ -106,18 +102,19 @@ while (<FH>) {
 		}
 		if ($output) {
 			my $t = sprintf("%8.6f", $ts - $out_start);
-			my $ax1 = $as_x1_avg / 5;
-			my $ax2 = $as_x2_avg / 5;
-			my $ay = $as_y_avg / 5;
-			print $output "$t $ts $ax1 $ax2 $ay $x_prev2 $y_prev2\n";
+			my $ax1 = $as_x1;
+			my $ax2 = $as_x2;
+			my $ay = $as_y;
+			my $dy = $y - $as_y;
+			print $output "$t $ts $ax1 $ax2 $ay $x $y $dy\n";
 		}
 		# todo only update with one of the as
-		$x_prev2 = $x_prev;
-		$y_prev2 = $y_prev;
-		$ts_prev2 = $ts_prev;
-		$x_prev = $x;
-		$y_prev = $y;
-		$ts_prev = $ts;
+		#$x_prev2 = $x_prev;
+		#$y_prev2 = $y_prev;
+		#$ts_prev2 = $ts_prev;
+		#$x_prev = $x;
+		#$y_prev = $y;
+		#$ts_prev = $ts;
 	} elsif (/^\s*([\d.]+)\s+HOME endstop (\d+)$/) {
 		print $_;
 		if (@home_seq == 0) {
