@@ -202,13 +202,13 @@ model1(void *ctx, buffer_elem_t *be)
 		m->avg_x2 += as_x2;
 		m->avg_y += as_y;
 		if ((++m->avg_cnt % 100) == 0) {
-			printf("% 8.9f AVG %d %f %f %f\n",
+			printf("% 8.9f AVG %02d % 4.3f % 4.3f delta % 4.3f % 4.3f\n",
 				avg_time,
-				m->avg_cnt,
+				(m->avg_cnt % 10000) / 100,
 				m->avg_x1 / 100,
 				m->avg_x2 / 100,
+				(m->avg_x1 - m->avg_x2) / 100,
 				m->avg_y / 100);
-			m->avg_cnt = 0;
 			m->avg_x1 = 0;
 			m->avg_x2 = 0;
 			m->avg_y = 0;
@@ -373,6 +373,13 @@ mod_as5311(model_t *m, buffer_elem_t *be)
 		/* first time here */
 		m->as5311_pos_lo[ch] = pos;
 		m->as5311_pos_hi[ch] = 0;
+		m->home_as[ch] = pos / 2048.;
+		if (ch == 0)
+			m->home_as[ch] -= X_HOME;
+		else if (ch == 1)
+			m->home_as[ch] += X_HOME;
+		else
+			m->home_as[ch] -= Y_HOME;
 	}
 
 	/* detect over/underrun at 1/3, 2/3 */
