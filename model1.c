@@ -8,6 +8,7 @@ typedef unsigned long __uintptr_t;
 #include "models.h"
 
 #define NAS5311		3
+#define NDRO		1
 #define NSTEP		6
 #define NENDSTOP	4
 
@@ -30,7 +31,7 @@ typedef unsigned long __uintptr_t;
 #if 0
 #define XY_STEPS_PER_MM (400.0 * 32 / 32.0)
 #else
-#define XY_STEPS_PER_MM (1/0.0024921)
+#define XY_STEPS_PER_MM (1/0.0025005)
 #endif
 
 struct _model;
@@ -77,6 +78,11 @@ typedef struct _model {
 	double		chg_x;
 	double		chg_y;
 	uint64_t	chg_t;
+	double		dro[NDRO];
+	int		avg_cnt;
+	double		avg_x1;
+	double		avg_x2;
+	double		avg_y;
 } model_t;
 
 #define MAX_TIME ((uint64_t)(-1ll))
@@ -88,6 +94,7 @@ static void sig_tick(model_t *m, buffer_elem_t *be);
 static int verbose = 0;
 static void mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be);
 static void mod_packet_tx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be);
+static void mod_dro(model_t *m, buffer_elem_t *be);
 
 #define lD(...) if (verbose) printf(__VA_ARGS__)
 
@@ -141,6 +148,7 @@ model1(void *ctx, buffer_elem_t *be)
 		mod_as5311(m, be);
 		break;
 	case MT_DRO:
+		mod_dro(m, be);
 		break;
 	}
 
@@ -177,16 +185,34 @@ model1(void *ctx, buffer_elem_t *be)
 #endif
 	m->chg_mask |= m->changed;
 	if ((m->chg_mask & 7) == 7) {
+		double avg_time = (double)((be->systime + m->chg_t) / 2 - m->first_systime) / HZ;
+
 		/* all as5311 seen, emit one line */
-		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f e %d\n",
-			(double)((be->systime + m->chg_t) / 2 - m->first_systime) / HZ,
+		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f e %d dro %.3f\n",
+			avg_time,
 			as_x1, as_x2, as_y,
 			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
-			z1, z2, z3, e);
+			z1, z2, z3, e, m->dro[0]);
 		m->chg_x = x;
 		m->chg_y = y;
 		m->chg_t = be->systime;
 		m->chg_mask = 0;
+
+		m->avg_x1 += as_x1;
+		m->avg_x2 += as_x2;
+		m->avg_y += as_y;
+		if ((++m->avg_cnt % 100) == 0) {
+			printf("% 8.9f AVG %d %f %f %f\n",
+				avg_time,
+				m->avg_cnt,
+				m->avg_x1 / 100,
+				m->avg_x2 / 100,
+				m->avg_y / 100);
+			m->avg_cnt = 0;
+			m->avg_x1 = 0;
+			m->avg_x2 = 0;
+			m->avg_y = 0;
+		}
 	}
 }
 
@@ -365,6 +391,20 @@ mod_as5311(model_t *m, buffer_elem_t *be)
 		m->changed |= CHG_AS_X2;
 	else if (ch == 2)
 		m->changed |= CHG_AS_Y;
+}
+
+static void
+mod_dro(model_t *m, buffer_elem_t *be)
+{
+	int ch = be->values[0].ui;
+	double val = be->values[1].f;
+
+	if (ch >= NDRO)
+		report("dro channel %d out of range\n", ch);
+
+	lD("dro[%d] val %f\n", ch, val);
+
+	m->dro[ch] = val;
 }
 
 #define MS_IDLE		0

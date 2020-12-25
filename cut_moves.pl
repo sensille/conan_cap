@@ -44,9 +44,9 @@ my $as_y_rptr = 0;
 while (<FH>) {
 	next unless (/^\s*([\d.]+)\s/);
 
-	if (/^\s*([\d.]+)\s+CMPL as (\S+) (\S+) (\S+) x.y (\S+) (\S+) z (\S+) (\S+) (\S+) e (\S+)$/) {
-		my ($ts, $as_x1, $as_x2, $as_y, $x, $y, $z1, $z2, $z3, $e) =
-			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+	if (/^\s*([\d.]+)\s+CMPL as (\S+) (\S+) (\S+) x.y (\S+) (\S+) z (\S+) (\S+) (\S+) e (\S+) dro (\S+)$/) {
+		my ($ts, $as_x1, $as_x2, $as_y, $x, $y, $z1, $z2, $z3, $e, $dro) =
+			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);
 		if ($state eq "wait_z") {
 			# wait for z to reach <= 250
 			if ($z1 < 251) {
