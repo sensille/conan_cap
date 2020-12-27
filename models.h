@@ -42,4 +42,10 @@ void *init_model2(struct _parser *p,int verbose);
 void __attribute__ ((format (printf, 1, 2))) report(char *fmt, ...);
 uint64_t relate_systime(struct _parser *p, uint64_t systime, int bits);
 
+void enable_gcode(char *filename);
+void gcode(buffer_elem_t *be, double time,
+	double as_x1, double as_x2, double as_y,
+	double x, double y, double z1, double z2, double z3,
+	double e, double dr0);
+
 #endif

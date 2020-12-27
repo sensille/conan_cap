@@ -279,13 +279,15 @@ relate_systime(parser_t *p, uint64_t systime, int bits)
 	s2 = (p->systime_base >> (bits - 2)) & 0x03;
 	diff = (s2 - s1) & 0x03;
 
-	if (diff == 2 || diff == 3)
-		report("systime %ld out of range of %ld\n", systime,
+	if (diff == 2)
+		report("systime %lx out of range of %lx\n", systime,
 			p->systime_base);
 
 	rel = (p->systime_base & ~((1ull << bits) - 1)) | systime;
 	if (s2 == 0 && s1 == 3)
 		rel -= (1ull << bits);
+	if (s2 == 3 && s1 == 0)
+		rel += (1ull << bits);
 
 	return rel;
 }
@@ -717,7 +719,7 @@ main(int argc, char **argv)
 	int ret;
 	parser_t parser;
 
-	while ((c = getopt(argc, argv, "w:r:vuq12ih?")) != EOF) {
+	while ((c = getopt(argc, argv, "w:r:vuq12ig:h?")) != EOF) {
 		switch(c) {
 		case 'w':
 			wrname = optarg;
@@ -744,6 +746,9 @@ main(int argc, char **argv)
 		case '2':
 			mctx[nmodels] = init_model2(&parser, verbose);
 			models[nmodels++] = model2;
+			break;
+		case 'g':
+			enable_gcode(optarg);
 			break;
 		case 'h':
 		case '?':

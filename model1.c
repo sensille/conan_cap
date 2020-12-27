@@ -193,6 +193,11 @@ model1(void *ctx, buffer_elem_t *be)
 			as_x1, as_x2, as_y,
 			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
 			z1, z2, z3, e, m->dro[0]);
+
+		gcode(be, avg_time, as_x1, as_x2, as_y,
+			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
+			z1, z2, z3, e, m->dro[0]);
+
 		m->chg_x = x;
 		m->chg_y = y;
 		m->chg_t = be->systime;
