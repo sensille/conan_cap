@@ -11,6 +11,7 @@ typedef unsigned long __uintptr_t;
 #define NDRO		1
 #define NSTEP		6
 #define NENDSTOP	4
+#define NABZ		3
 
 #define HZ 48000000
 
@@ -83,11 +84,19 @@ typedef struct _model {
 	double		avg_x1;
 	double		avg_x2;
 	double		avg_y;
+	int		abz_first[NABZ];
+	unsigned int	abz_prev_phase[NABZ];
+	int		abz_step[NABZ];
+	double		abz_pos[NABZ];
+	double		abz_home[NABZ];
+	int		abz_inval_transition[NABZ];
+	int		abz_prev_z[NABZ];
 } model_t;
 
 #define MAX_TIME ((uint64_t)(-1ll))
 
 static void mod_signal(model_t *m, buffer_elem_t *be);
+static void mod_abz(model_t *m, buffer_elem_t *be);
 static void mod_as5311(model_t *m, buffer_elem_t *be);
 static void mod_mcu(model_t *m, buffer_elem_t *be);
 static void sig_tick(model_t *m, buffer_elem_t *be);
@@ -111,6 +120,9 @@ init_model1(struct _parser *p, int verb)
 		m->as5311_pos_lo[i] = -1;
 
 	m->sig_first = 1;
+
+	for (i = 0; i < NABZ; ++i)
+		m->abz_first[i] = 1;
 
 	m->mcu_ch[0].packet = mod_packet_tx;
 	m->mcu_ch[1].packet = mod_packet_rx;
@@ -144,6 +156,9 @@ model1(void *ctx, buffer_elem_t *be)
 	case MT_SIG:
 		mod_signal(m, be);
 		break;
+	case MT_ABZ:
+		mod_abz(m, be);
+		break;
 	case MT_AS5311:
 		mod_as5311(m, be);
 		break;
@@ -170,14 +185,19 @@ model1(void *ctx, buffer_elem_t *be)
 	double as_x2 = +(m->as5311_pos[1] - m->home_as[1]) + X_HOME;
 	double as_y = m->as5311_pos[2] - m->home_as[2] + Y_HOME;
 	int e = m->sig_steppos[5];
+	double ab_x1 = -(m->abz_pos[1] - m->abz_home[1]) + X_HOME;
+	double ab_x2 = +(m->abz_pos[2] - m->abz_home[2]) + X_HOME;
+	double ab_y = m->abz_pos[0] - m->abz_home[0] + Y_HOME;
 
 	if (m->first_systime == 0)
 		m->first_systime = be->systime;
 
-	lD("% 14ld model as[0]=%f as[1]=%f as[2]=%f x=%f y=%f z1=%f z2=%f z3=%f e=%d\n",
+	lD("% 14ld model as[0]=%f as[1]=%f as[2]=%f x=%f y=%f z1=%f z2=%f "
+	   "z3=%f e=%d\n",
 		be->systime, as_x1, as_x2, as_y, x, y, z1, z2, z3, e);
 #if 0
-	printf("% 8.9f DATA chg %d as %f %f %f x/y %f %f z %f %f %f e %d delta_as %f dx_as1 %f dx_as2 %f dy_as %f\n",
+	printf("% 8.9f DATA chg %d as %f %f %f x/y %f %f z %f %f %f e %d "
+		"delta_as %f dx_as1 %f dx_as2 %f dy_as %f\n",
 		(double)(be->systime - m->first_systime) / HZ,
 		m->changed,
 		as_x1, as_x2, as_y, x, y, z1, z2, z3, e,
@@ -185,14 +205,17 @@ model1(void *ctx, buffer_elem_t *be)
 #endif
 	m->chg_mask |= m->changed;
 	if ((m->chg_mask & 7) == 7) {
-		double avg_time = (double)((be->systime + m->chg_t) / 2 - m->first_systime) / HZ;
+		double avg_time = (double)((be->systime + m->chg_t) /
+			2 - m->first_systime) / HZ;
 
 		/* all as5311 seen, emit one line */
-		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f e %d dro %.3f\n",
+		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f "
+			"e %d dro %.3f AB %f %f %f\n",
 			avg_time,
 			as_x1, as_x2, as_y,
 			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
-			z1, z2, z3, e, m->dro[0]);
+			z1, z2, z3, e, m->dro[0],
+			ab_x1, ab_x2, ab_y);
 
 		gcode(be, avg_time, as_x1, as_x2, as_y,
 			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
@@ -207,7 +230,8 @@ model1(void *ctx, buffer_elem_t *be)
 		m->avg_x2 += as_x2;
 		m->avg_y += as_y;
 		if ((++m->avg_cnt % 100) == 0) {
-			printf("% 8.9f AVG %02d % 4.3f % 4.3f delta % 4.3f % 4.3f\n",
+			printf(
+			  "% 8.9f AVG %02d % 4.3f % 4.3f delta % 4.3f % 4.3f\n",
 				avg_time,
 				(m->avg_cnt % 10000) / 100,
 				m->avg_x1 / 100,
@@ -313,6 +337,77 @@ mod_signal(model_t *m, buffer_elem_t *be)
 }
 
 static void
+mod_abz(model_t *m, buffer_elem_t *be)
+{
+	uint32_t data = be->values[0].ui;
+	int valid = be->values[1].ui;
+	int i;
+	unsigned int phase;
+	int add;
+	unsigned int prev_phase;
+
+	if (valid == 0)
+		return;
+
+	/*
+	 * [0, 1, 2] a, b, z [0]
+	 * [3, 4, 5] a, b, z [1]
+	 * [6, 7, 8] a, b, z [2]
+	 */
+	for (i = 0; i < NABZ; ++i) {
+		int a = !!(data & (1 << (i * 3 + 0)));
+		int b = !!(data & (1 << (i * 3 + 1)));
+		int z = !!(data & (1 << (i * 3 + 2)));
+
+		if (a == 0 && b == 0)
+			phase = 0;
+		else if (a == 1 && b == 0)
+			phase = 1;
+		else if (a == 1 && b == 1)
+			phase = 2;
+		else
+			phase = 3;
+
+		if (m->abz_first[i])
+			m->abz_prev_phase[i] = phase;
+		m->abz_first[i] = 0;
+		prev_phase = m->abz_prev_phase[i];
+		m->abz_prev_phase[i] = phase;
+printf("% 14ld [%i] a %d b %d phase %d prev_phase %d\n", be->systime, i, a, b, phase, prev_phase);
+
+		if (prev_phase == phase) {
+			continue;
+		} else if (((prev_phase + 1) % 4) == phase) {
+			add = 1;
+		} else if (((prev_phase - 1) % 4) == phase) {
+			add = -1;
+		} else {
+			++m->abz_inval_transition[i];
+			printf("% 14ld abz: invalid state transition #%d "
+				"%d->%d\n", be->systime,
+				m->abz_inval_transition[i], prev_phase, phase);
+			continue;
+#if 0
+			report("invalid state transition in abz\n");
+#endif
+		}
+
+		m->abz_step[i] += add;
+		m->abz_pos[i] = m->abz_step[i] / 2048.;
+		if (add != 0)
+			printf("% 14ld abz: [%d] pos %f\n", be->systime, i,
+				m->abz_pos[i]);
+
+		if (z) {
+			printf("% 14ld abz: [%d] z at pos %f diff %d\n",
+				be->systime, i, m->abz_pos[i],
+				m->abz_step[i] - m->abz_prev_z[i]);
+			m->abz_prev_z[i] = m->abz_step[i];
+		}
+	}
+}
+
+static void
 sig_tick(model_t *m, buffer_elem_t *be)
 {
 	int i;
@@ -342,10 +437,13 @@ sig_tick(model_t *m, buffer_elem_t *be)
 				m->home_x_stepper_y = m->sig_steppos[3];
 				m->home_as[0] = m->as5311_pos[0];
 				m->home_as[1] = m->as5311_pos[1];
+				m->abz_home[1] = m->abz_pos[1];
+				m->abz_home[2] = m->abz_pos[2];
 			} else if (i == 1) {
 				m->home_y_stepper_x = m->sig_steppos[4];
 				m->home_y_stepper_y = m->sig_steppos[3];
 				m->home_as[2] = m->as5311_pos[2];
+				m->abz_home[0] = m->abz_pos[0];
 			} else if (i == 2) {
 				m->home_z[0] = m->sig_steppos[0];
 				m->home_z[1] = m->sig_steppos[1];

@@ -73,6 +73,7 @@ typedef struct _parser {
 	int		mcu_systime_set;
 	uint64_t	newest_systime;
 	uint64_t	newest_delivered;
+	uint64_t	beseq;
 } parser_t;
 
 #define MAX_VALUES	20
@@ -161,7 +162,6 @@ sig_get_bits(signal_t *s, int n, uint32_t *out)
 static void
 sig_feed(parser_t *p, signal_t *s, uint32_t d, int len)
 {
-	int i;
 	uint32_t bits;
 	pipeline_t sample;
 
@@ -215,24 +215,11 @@ sig_feed(parser_t *p, signal_t *s, uint32_t d, int len)
 			s->cnt = (s->cnt << (s->rle - 2)) | bits;
 			s->state = SS_CNT_DONE;
 		} else if (s->state == SS_CNT_DONE) {
-			if (s->slot != 1) {
-				for (i = 0; i < s->cnt; ++i) {
-					sample = s->pipeline[s->slot - 1];
-					memmove(s->pipeline + 1,
-						s->pipeline + 0,
-						sizeof(*s->pipeline) *
-							(s->slot - 1));
-					s->pipeline[0] = sample;
-					sig_output(p, s, sample, 1);
-				}
-			} else {
-				/*
-				 * this is just a performance
-				 * optimization
-				 */
-				sample = s->pipeline[s->slot - 1];
-				sig_output(p, s, sample, s->cnt);
-			}
+			sample = s->pipeline[s->slot - 1];
+			memmove(s->pipeline + 1, s->pipeline + 0,
+				sizeof(*s->pipeline) * (s->slot - 1));
+			s->pipeline[0] = sample;
+			sig_output(p, s, sample, s->cnt);
 			s->state = SS_IDLE;
 		} else {
 			report("inval sig state %d\n", s->state);
@@ -593,6 +580,10 @@ int becmp(buffer_elem_t *e1, buffer_elem_t *e2)
 		return -1;
 	if (e1->systime > e2->systime)
 		return 1;
+	if (e1->beseq < e2->beseq)
+		return -1;
+	if (e1->beseq > e2->beseq)
+		return -1;
 	return 0;
 }
 
@@ -676,6 +667,7 @@ output(parser_t *p, uint64_t systime, int mtype, int n, value_t *values_in)
 	be->mtype = mtype;
 	be->n = n;
 	be->values = values;
+	be->beseq = ++p->beseq;
 
 	if (systime == 0 || dont_sort) {
 		/* no systime, output directly */

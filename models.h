@@ -23,6 +23,7 @@ typedef struct _buffer_elem {
 	int			mtype;
 	int			n;
 	value_t			*values;
+	uint64_t		beseq;
 } buffer_elem_t;
 
 typedef enum {
