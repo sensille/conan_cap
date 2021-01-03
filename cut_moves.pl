@@ -13,6 +13,8 @@ my ($file, $start, $end)  = @ARGV;
 open(FH, '<', $file) or die "opening $file failed";
 
 # 19.749500000 DATA as -13.090332 -10.634766 -0.003906 x/y -12.000000 0.029905 z 270.000000 270.000000 270.000000 e 0 delta_as -2.455566 dx_as1 1.090332 dx_as2 -1.365234 dy_as 0.033811
+# 0.000000000 CMPL as 0.000000 0.000488 0.000000 x/y -12.000000 0.000000 z 270.000000 270.000000 270.000000 e 0 dro 0.000 AB -12.000000 -12.000000 -0.000977
+
 # 19.749501083 HOME endstop 1
 
 my @home_seq = (2, 2, 1, 1, 0, 0);
@@ -44,9 +46,9 @@ my $as_y_rptr = 0;
 while (<FH>) {
 	next unless (/^\s*([\d.]+)\s/);
 
-	if (/^\s*([\d.]+)\s+CMPL as (\S+) (\S+) (\S+) x.y (\S+) (\S+) z (\S+) (\S+) (\S+) e (\S+) dro (\S+)$/) {
-		my ($ts, $as_x1, $as_x2, $as_y, $x, $y, $z1, $z2, $z3, $e, $dro) =
-			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);
+	if (/^\s*([\d.]+)\s+CMPL as (\S+) (\S+) (\S+) x.y (\S+) (\S+) z (\S+) (\S+) (\S+) e (\S+) dro (\S+) ab (\S+) (\S+) (\S+)$/) {
+		my ($ts, $as_x1, $as_x2, $as_y, $x, $y, $z1, $z2, $z3, $e, $dro, $ab_x1, $ab_x2, $ab_y) =
+			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14);
 		if ($state eq "wait_z") {
 			# wait for z to reach <= 250
 			if ($z1 < 251) {
@@ -106,7 +108,7 @@ while (<FH>) {
 			my $ax2 = $as_x2;
 			my $ay = $as_y;
 			my $dy = $y - $as_y;
-			print $output "$t $ts $ax1 $ax2 $ay $x $y $dy\n";
+			print $output "$t $ts $ax1 $ax2 $ay $x $y $dy $ab_x1 $ab_x2 $ab_y\n";
 		}
 		# todo only update with one of the as
 		#$x_prev2 = $x_prev;

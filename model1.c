@@ -210,7 +210,7 @@ model1(void *ctx, buffer_elem_t *be)
 
 		/* all as5311 seen, emit one line */
 		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f "
-			"e %d dro %.3f AB %f %f %f\n",
+			"e %d dro %.3f ab %f %f %f\n",
 			avg_time,
 			as_x1, as_x2, as_y,
 			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
@@ -346,8 +346,11 @@ mod_abz(model_t *m, buffer_elem_t *be)
 	int add;
 	unsigned int prev_phase;
 
-	if (valid == 0)
+	if (valid == 0) {
+		for (i = 0; i < NABZ; ++i)
+			m->abz_first[i] = 1;
 		return;
+	}
 
 	/*
 	 * [0, 1, 2] a, b, z [0]
@@ -373,7 +376,8 @@ mod_abz(model_t *m, buffer_elem_t *be)
 		m->abz_first[i] = 0;
 		prev_phase = m->abz_prev_phase[i];
 		m->abz_prev_phase[i] = phase;
-printf("% 14ld [%i] a %d b %d phase %d prev_phase %d\n", be->systime, i, a, b, phase, prev_phase);
+		lD("% 14ld [%i] a %d b %d phase %d prev_phase %d\n",
+			be->systime, i, a, b, phase, prev_phase);
 
 		if (prev_phase == phase) {
 			continue;
@@ -383,23 +387,20 @@ printf("% 14ld [%i] a %d b %d phase %d prev_phase %d\n", be->systime, i, a, b, p
 			add = -1;
 		} else {
 			++m->abz_inval_transition[i];
-			printf("% 14ld abz: invalid state transition #%d "
+			report("% 14ld abz: invalid state transition #%d "
 				"%d->%d\n", be->systime,
 				m->abz_inval_transition[i], prev_phase, phase);
 			continue;
-#if 0
-			report("invalid state transition in abz\n");
-#endif
 		}
 
 		m->abz_step[i] += add;
 		m->abz_pos[i] = m->abz_step[i] / 2048.;
 		if (add != 0)
-			printf("% 14ld abz: [%d] pos %f\n", be->systime, i,
+			lD("% 14ld abz: [%d] pos %f\n", be->systime, i,
 				m->abz_pos[i]);
 
 		if (z) {
-			printf("% 14ld abz: [%d] z at pos %f diff %d\n",
+			lD("% 14ld abz: [%d] z at pos %f diff %d\n",
 				be->systime, i, m->abz_pos[i],
 				m->abz_step[i] - m->abz_prev_z[i]);
 			m->abz_prev_z[i] = m->abz_step[i];
