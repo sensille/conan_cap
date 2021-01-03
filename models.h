@@ -29,6 +29,7 @@ typedef enum {
 	MT_MCU,
 	MT_SYSTIME,
 	MT_SIG,
+	MT_ABZ,
 	MT_AS5311,
 	MT_DRO,
 } msg_type_t;

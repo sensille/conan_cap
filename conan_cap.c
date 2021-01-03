@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -30,6 +31,7 @@ typedef unsigned long __uintptr_t;
 #define DAQT_SYSTIME_ROLLOVER 33
 #define DAQT_DRO_DATA         48
 #define DAQT_SIGNAL_DATA      64
+#define DAQT_ABZ_DATA         72
 
 #define lD(...) if (verbose) printf(__VA_ARGS__)
 #define SS_IDLE		0
@@ -56,6 +58,7 @@ typedef struct _signal {
 	int		first_packet;
 	uint64_t	systime;
 	int		systime_related;
+	int		mt;
 } signal_t;
 
 typedef struct _parser {
@@ -65,6 +68,7 @@ typedef struct _parser {
 	uint64_t	systime_base;
 	int		base_set;
 	signal_t	signal;
+	signal_t	abz;
 	uint64_t	mcu_systime;
 	int		mcu_systime_set;
 	uint64_t	newest_systime;
@@ -73,10 +77,11 @@ typedef struct _parser {
 
 #define MAX_VALUES	20
 
-const char *type_names[] = { "mcu", "systime", "sig", "as5311", "dro" };
+const char *type_names[] = { "mcu", "systime", "sig", "abz", "as5311", "dro" };
 const char *field_names[][MAX_VALUES] = {
 	{ "dir", "data", },
 	{ "type", },
+	{ "data", "valid", "cnt", },
 	{ "data", "valid", "cnt", },
 	{ "channel", "type", "pos", "status", },
 	{ "channel", "data" },
@@ -114,17 +119,17 @@ report(char *fmt, ...)
 }
 
 static void
-init_signal(signal_t *s)
+init_signal(signal_t *s, int mt)
 {
 	memset(s, 0, sizeof(*s));
 	s->state = SS_IDLE;
 	s->first_packet = 1;
+	s->mt = mt;
 }
 
 static void
-sig_output(parser_t *p, pipeline_t sample, int n)
+sig_output(parser_t *p, signal_t *s, pipeline_t sample, int n)
 {
-	signal_t *s = &p->signal;
 	value_t v[3];
 
 	v[0].type = VT_HEX;
@@ -134,7 +139,7 @@ sig_output(parser_t *p, pipeline_t sample, int n)
 	v[2].type = VT_UINT;
 	v[2].ui = n;
 
-	output(p, s->systime, MT_SIG, 3, v);
+	output(p, s->systime, s->mt, 3, v);
 
 	s->systime += n;
 }
@@ -154,9 +159,8 @@ sig_get_bits(signal_t *s, int n, uint32_t *out)
 }
 
 static void
-sig_feed(parser_t *p, uint32_t d, int len)
+sig_feed(parser_t *p, signal_t *s, uint32_t d, int len)
 {
-	signal_t *s = &p->signal;
 	int i;
 	uint32_t bits;
 	pipeline_t sample;
@@ -183,7 +187,7 @@ sig_feed(parser_t *p, uint32_t d, int len)
 				sizeof(*s->pipeline) * 6);
 			s->pipeline[0].data = bits;
 			s->pipeline[0].valid = 1;
-			sig_output(p, s->pipeline[0], 1);
+			sig_output(p, s, s->pipeline[0], 1);
 			s->state = SS_IDLE;
 		} else if (s->state == SS_CNT_PRE) {
 			if (!sig_get_bits(s, 5, &bits))
@@ -219,7 +223,7 @@ sig_feed(parser_t *p, uint32_t d, int len)
 						sizeof(*s->pipeline) *
 							(s->slot - 1));
 					s->pipeline[0] = sample;
-					sig_output(p, sample, 1);
+					sig_output(p, s, sample, 1);
 				}
 			} else {
 				/*
@@ -227,7 +231,7 @@ sig_feed(parser_t *p, uint32_t d, int len)
 				 * optimization
 				 */
 				sample = s->pipeline[s->slot - 1];
-				sig_output(p, sample, s->cnt);
+				sig_output(p, s, sample, s->cnt);
 			}
 			s->state = SS_IDLE;
 		} else {
@@ -244,7 +248,8 @@ init_parser(parser_t *p)
 	memset(p, 0, sizeof(*p));
 	p->seq = -1;
 	p->first_frame = 1;
-	init_signal(&p->signal);
+	init_signal(&p->signal, MT_SIG);
+	init_signal(&p->abz, MT_ABZ);
 
 	for (i = 0; i < nmodels; ++i) {
 		/* XXX well ... */
@@ -440,9 +445,8 @@ recv_dro_data(parser_t *p, uint32_t *b, int len)
 }
 
 static int
-recv_signal_data(parser_t *p, uint32_t *b, int len)
+_recv_signal_data(parser_t *p, signal_t *s, uint32_t *b, int len)
 {
-	signal_t *s = &p->signal;
 	uint8_t off = (b[0] >> 18) & 0x1f;
 	uint8_t rle = (b[0] >> 13) & 0x1f;
 	uint8_t width = (b[0] >> 8) & 0x1f;
@@ -471,15 +475,31 @@ recv_signal_data(parser_t *p, uint32_t *b, int len)
 	s->rle = rle;
 
 	if (s->first_packet && off) {
-		sig_feed(p, b[2] & ((1 << (32 - off)) - 1), 32 - off);
+		sig_feed(p, s, b[2] & ((1 << (32 - off)) - 1), 32 - off);
 		i = 1;
 	}
 	s->first_packet = 0;
 
 	for (; i < stlen; ++i)
-		sig_feed(p, b[2 + i], 32);
+		sig_feed(p, s, b[2 + i], 32);
 
 	return stlen + 2;
+}
+
+static int
+recv_signal_data(parser_t *p, uint32_t *b, int len)
+{
+	signal_t *s = &p->signal;
+
+	return _recv_signal_data(p, s, b, len);
+}
+
+static int
+recv_abz_data(parser_t *p, uint32_t *b, int len)
+{
+	signal_t *s = &p->abz;
+
+	return _recv_signal_data(p, s, b, len);
 }
 
 static void
@@ -545,6 +565,9 @@ parse_frame(parser_t *p, uint8_t *pbuf, int len)
 			break;
 		case DAQT_SIGNAL_DATA:
 			l = recv_signal_data(p, b, len);
+			break;
+		case DAQT_ABZ_DATA:
+			l = recv_abz_data(p, b, len);
 			break;
 		case 0xff:
 			l = 1;
@@ -718,6 +741,9 @@ main(int argc, char **argv)
 	int infd = -1;
 	int ret;
 	parser_t parser;
+	long tlen = 0;
+	struct timeval now;
+	struct timeval before;
 
 	while ((c = getopt(argc, argv, "w:r:vuq12ig:h?")) != EOF) {
 		switch(c) {
@@ -853,7 +879,12 @@ main(int argc, char **argv)
 				printf("short write\n");
 				exit(1);
 			}
-			printf("%d\n", len);
+			gettimeofday(&now, NULL);
+			if (now.tv_sec != before.tv_sec) {
+				printf("%ld\n", tlen);
+				before = now;
+			}
+			tlen += len;
 		} else {
 			parse_frame(&parser, buf, len);
 		}
