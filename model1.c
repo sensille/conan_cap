@@ -84,6 +84,7 @@ typedef struct _model {
 	double		avg_x1;
 	double		avg_x2;
 	double		avg_y;
+	double		avg_ab_y;
 	int		abz_first[NABZ];
 	unsigned int	abz_prev_phase[NABZ];
 	int		abz_step[NABZ];
@@ -101,6 +102,7 @@ static void mod_as5311(model_t *m, buffer_elem_t *be);
 static void mod_mcu(model_t *m, buffer_elem_t *be);
 static void sig_tick(model_t *m, buffer_elem_t *be);
 static int verbose = 0;
+static int only_avg = 0;
 static void mod_packet_rx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be);
 static void mod_packet_tx(model_t *m, mcu_ch_t *mc, buffer_elem_t *be);
 static void mod_dro(model_t *m, buffer_elem_t *be);
@@ -108,12 +110,13 @@ static void mod_dro(model_t *m, buffer_elem_t *be);
 #define lD(...) if (verbose) printf(__VA_ARGS__)
 
 void *
-init_model1(struct _parser *p, int verb)
+init_model1(struct _parser *p, int verb, int avg)
 {
 	model_t *m = calloc(sizeof(*m), 1);
 	int i;
 
 	verbose = verb;
+	only_avg = avg;
 	m->parser = p;
 
 	for (i = 0; i < NAS5311; ++i)
@@ -209,13 +212,15 @@ model1(void *ctx, buffer_elem_t *be)
 			2 - m->first_systime) / HZ;
 
 		/* all as5311 seen, emit one line */
-		printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f "
-			"e %d dro %.3f ab %f %f %f\n",
-			avg_time,
-			as_x1, as_x2, as_y,
-			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
-			z1, z2, z3, e, m->dro[0],
-			ab_x1, ab_x2, ab_y);
+		if (!only_avg) {
+			printf("% 8.9f CMPL as %f %f %f x/y %f %f z %f %f %f "
+				"e %d dro %.3f ab %f %f %f\n",
+				avg_time,
+				as_x1, as_x2, as_y,
+				(x + m->chg_x) / 2, (y + m->chg_y) / 2,
+				z1, z2, z3, e, m->dro[0],
+				ab_x1, ab_x2, ab_y);
+		}
 
 		gcode(be, avg_time, as_x1, as_x2, as_y,
 			(x + m->chg_x) / 2, (y + m->chg_y) / 2,
@@ -229,18 +234,23 @@ model1(void *ctx, buffer_elem_t *be)
 		m->avg_x1 += as_x1;
 		m->avg_x2 += as_x2;
 		m->avg_y += as_y;
+		m->avg_ab_y += ab_y;
 		if ((++m->avg_cnt % 100) == 0) {
-			printf(
-			  "% 8.9f AVG %02d % 4.3f % 4.3f delta % 4.3f % 4.3f\n",
+			printf("% 8.9f AVG %02d % 4.3f % 4.3f delta % 4.3f "
+				"% 4.3f % 4.3f diff % 4.3f dro % 4.3f\n",
 				avg_time,
 				(m->avg_cnt % 10000) / 100,
 				m->avg_x1 / 100,
 				m->avg_x2 / 100,
 				(m->avg_x1 - m->avg_x2) / 100,
-				m->avg_y / 100);
+				m->avg_y / 100,
+				m->avg_ab_y / 100,
+				m->avg_y / 100 - m->avg_ab_y / 100,
+				m->dro[0]);
 			m->avg_x1 = 0;
 			m->avg_x2 = 0;
 			m->avg_y = 0;
+			m->avg_ab_y = 0;
 		}
 	}
 }

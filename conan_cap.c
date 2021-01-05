@@ -93,6 +93,7 @@ int nmodels = 0;
 void (*models[MAX_MODELS])(void *ctx, buffer_elem_t *be);
 void *mctx[MAX_MODELS];
 int verbose = 0;
+int avg = 0;
 static int dont_sort = 0;
 static int re_init_allowed = 0;
 
@@ -241,9 +242,9 @@ init_parser(parser_t *p)
 	for (i = 0; i < nmodels; ++i) {
 		/* XXX well ... */
 		if (models[i] == model1)
-			mctx[i] = init_model1(p, verbose);
+			mctx[i] = init_model1(p, verbose, avg);
 		if (models[i] == model2)
-			mctx[i] = init_model2(p, verbose);
+			mctx[i] = init_model2(p, verbose, avg);
 	}
 }
 
@@ -717,6 +718,7 @@ usage(void)
 	printf("       -1          : feed to model 1\n");
 	printf("       -u          : unsorted, don't sort by timestamp\n");
 	printf("       -i          : re-init state on a frame-seq reset\n");
+	printf("       -a          : only output average (direct mode)\n");
 	exit(1);
 }
 
@@ -737,7 +739,7 @@ main(int argc, char **argv)
 	struct timeval now;
 	struct timeval before;
 
-	while ((c = getopt(argc, argv, "w:r:vuq12ig:h?")) != EOF) {
+	while ((c = getopt(argc, argv, "w:r:vuq12ig:ah?")) != EOF) {
 		switch(c) {
 		case 'w':
 			wrname = optarg;
@@ -751,6 +753,9 @@ main(int argc, char **argv)
 		case 'v':
 			verbose = 1;
 			break;
+		case 'a':
+			avg = 1;
+			break;
 		case 'q':
 			do_output = 0;
 			break;
@@ -758,11 +763,11 @@ main(int argc, char **argv)
 			re_init_allowed = 1;
 			break;
 		case '1':
-			mctx[nmodels] = init_model1(&parser, verbose);
+			mctx[nmodels] = init_model1(&parser, verbose, avg);
 			models[nmodels++] = model1;
 			break;
 		case '2':
-			mctx[nmodels] = init_model2(&parser, verbose);
+			mctx[nmodels] = init_model2(&parser, verbose, avg);
 			models[nmodels++] = model2;
 			break;
 		case 'g':

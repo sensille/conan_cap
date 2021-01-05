@@ -22,7 +22,7 @@ static int verbose = 0;
 #define lD(...) if (verbose) printf(__VA_ARGS__)
 
 void *
-init_model2(struct _parser *p, int verb)
+init_model2(struct _parser *p, int verb, int avg)
 {
 	model_t *m = calloc(sizeof(*m), 1);
 	m->parser = p;
